@@ -1,3 +1,7 @@
 /target
 Cargo.lock
 *.log
+
+# Scratch images written by the "📎 Image" clipboard-paste feature into the
+# session workdir (this repo can itself be a workdir).
+.ccgui-paste-*.png

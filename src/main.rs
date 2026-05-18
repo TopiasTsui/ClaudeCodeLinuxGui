@@ -25,8 +25,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gtk::gdk::prelude::TextureExt;
 use gtk::prelude::*;
 use gtk::{glib, Application, ApplicationWindow};
 use webkit6::prelude::*;
@@ -41,6 +43,83 @@ fn mode_flag(idx: u32) -> Option<&'static str> {
         3 => Some("auto"),
         _ => None,
     }
+}
+
+// ── Built-in command handling ────────────────────────────────────────────
+//
+// See DESIGN.md. The GUI is a thin transport: this table describes only the
+// *mechanism* of each command, never a value domain (no model names, no
+// effort levels, no window sizes — the CLI is the validator). `/help` is
+// generated from this table; adding a command is one row, zero new widgets.
+// Unrecognised `/x` falls through to Route::Passthrough (sent verbatim).
+
+enum Route {
+    /// Set a spawn flag from the verbatim argument, respawn with `--resume`
+    /// (context carries). The CLI validates the value.
+    RespawnFlag(&'static str),
+    /// Respawn WITHOUT `--resume`: fresh session + cleared transcript.
+    Clear,
+    /// Answered locally by the GUI; no model round-trip.
+    Local(Local),
+}
+
+#[derive(Clone, Copy)]
+enum Local {
+    Status,
+    Help,
+}
+
+struct Cmd {
+    name: &'static str,
+    route: Route,
+    /// Shown in `/help` only — never used to reject a value (CLI validates).
+    usage: &'static str,
+    help: &'static str,
+}
+
+const COMMANDS: &[Cmd] = &[
+    Cmd {
+        name: "/model",
+        route: Route::RespawnFlag("--model"),
+        usage: "/model [alias|full-id]",
+        help: "switch model (no arg: show current); value passed to the CLI as-is",
+    },
+    Cmd {
+        name: "/permission-mode",
+        route: Route::RespawnFlag("--permission-mode"),
+        usage: "/permission-mode <mode>",
+        help: "set permission mode (overrides the dropdown); CLI validates",
+    },
+    Cmd {
+        name: "/clear",
+        route: Route::Clear,
+        usage: "/clear",
+        help: "start a fresh session (conversation context dropped)",
+    },
+    Cmd {
+        name: "/status",
+        route: Route::Local(Local::Status),
+        usage: "/status",
+        help: "show model / session id / permission-mode / last-turn tokens",
+    },
+    Cmd {
+        name: "/help",
+        route: Route::Local(Local::Help),
+        usage: "/help",
+        help: "list these commands",
+    },
+];
+
+fn lookup_cmd(name: &str) -> Option<&'static Cmd> {
+    COMMANDS.iter().find(|c| c.name == name)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Usage {
+    input: u64,
+    cache_create: u64,
+    cache_read: u64,
+    output: u64,
 }
 
 fn resolve_claude() -> String {
@@ -66,12 +145,17 @@ fn resolve_claude() -> String {
 struct TurnResult {
     result: String,
     session_id: Option<String>,
-    cost: f64,
+    usage: Usage,
     denials: Vec<String>,
     denied_dirs: Vec<String>,
 }
 
 enum Ev {
+    /// stream-json `system`/`init`: carries the model actually in use.
+    Init {
+        model: Option<String>,
+        session_id: Option<String>,
+    },
     Delta(String),
     Tool(String),
     Thinking,
@@ -83,12 +167,30 @@ enum Ev {
 struct Session {
     workdir: Option<PathBuf>,
     session_id: Option<String>,
-    total_cost: f64,
     pending_approval: bool,
     pending_dirs: Vec<String>,
     allowed_dirs: Vec<String>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
+    // Route-A state. `overrides` are extra (flag, value) pairs applied at
+    // spawn time (e.g. ("--model","opus")); a repeated flag replaces, not
+    // accumulates. `good_overrides` is the last config that spawned without
+    // immediately dying — restored if a command's respawn fails. `cmd_pending`
+    // marks a respawn triggered by a command so an immediate process death is
+    // treated as "bad argument → roll back" rather than a normal end.
+    overrides: Vec<(String, String)>,
+    good_overrides: Vec<(String, String)>,
+    cmd_pending: bool,
+    cmd_recovering: bool,
+    // Filled from the stream-json init event / result usage; powers /status.
+    model: Option<String>,
+    last_usage: Option<Usage>,
+}
+
+/// Set/replace an override flag (verbatim value; the CLI validates it).
+fn set_override(s: &mut Session, flag: &str, val: &str) {
+    s.overrides.retain(|(f, _)| f != flag);
+    s.overrides.push((flag.to_string(), val.to_string()));
 }
 
 fn esc(s: &str) -> String {
@@ -184,6 +286,7 @@ struct Tab {
     gen: Rc<Cell<u64>>,
     web: webkit6::WebView,
     entry: gtk::Entry,
+    img: gtk::Button,
     send: gtk::Button,
     approve: gtk::Button,
     mode: gtk::DropDown,
@@ -202,7 +305,16 @@ fn parse_result(v: &serde_json::Value) -> TurnResult {
         .unwrap_or("(empty response)")
         .to_string();
     let session_id = v.get("session_id").and_then(|x| x.as_str()).map(str::to_string);
-    let cost = v.get("total_cost_usd").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let u = v.get("usage");
+    let tok = |k: &str| {
+        u.and_then(|x| x.get(k)).and_then(|x| x.as_u64()).unwrap_or(0)
+    };
+    let usage = Usage {
+        input: tok("input_tokens"),
+        cache_create: tok("cache_creation_input_tokens"),
+        cache_read: tok("cache_read_input_tokens"),
+        output: tok("output_tokens"),
+    };
     let mut denials = Vec::new();
     let mut denied_dirs = Vec::new();
     if let Some(arr) = v.get("permission_denials").and_then(|x| x.as_array()) {
@@ -232,7 +344,7 @@ fn parse_result(v: &serde_json::Value) -> TurnResult {
             }
         }
     }
-    TurnResult { result, session_id, cost, denials, denied_dirs }
+    TurnResult { result, session_id, usage, denials, denied_dirs }
 }
 
 fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
@@ -255,10 +367,19 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
         }
     }
 
-    let pm = if force_accept_edits {
-        Some("acceptEdits")
+    let overrides: Vec<(String, String)> = tab.sess.borrow().overrides.clone();
+    // A `/permission-mode` override beats the dropdown (DESIGN: command and
+    // dropdown coexist for now).
+    let pm_override = overrides
+        .iter()
+        .find(|(f, _)| f == "--permission-mode")
+        .map(|(_, v)| v.clone());
+    let pm: Option<String> = if force_accept_edits {
+        Some("acceptEdits".to_string())
+    } else if let Some(v) = pm_override {
+        Some(v)
     } else {
-        mode_flag(tab.mode.selected())
+        mode_flag(tab.mode.selected()).map(str::to_string)
     };
 
     let mut cmd = Command::new(&**tab.bin);
@@ -273,13 +394,22 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
     if let Some(sid) = &resume_sid {
         cmd.arg("--resume").arg(sid);
     }
-    if let Some(m) = pm {
+    if let Some(m) = &pm {
         cmd.arg("--permission-mode").arg(m);
     }
     for d in &allowed_dirs {
         cmd.arg("--add-dir").arg(d);
     }
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    // Apply remaining route-A overrides verbatim (permission-mode already
+    // applied above). The CLI validates; a bad value just makes the process
+    // exit, which we detect below and roll back.
+    for (flag, val) in &overrides {
+        if flag == "--permission-mode" {
+            continue;
+        }
+        cmd.arg(flag).arg(val);
+    }
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -290,6 +420,27 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
     };
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Keep the tail of stderr so a failed respawn (e.g. bad `/model`) can
+    // surface the CLI's own error instead of a bare "stream closed".
+    let errbuf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    if let Some(err) = stderr {
+        let errbuf = errbuf.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(err);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(mut b) = errbuf.lock() {
+                    b.push_str(&line);
+                    b.push('\n');
+                    let len = b.len();
+                    if len > 2048 {
+                        *b = b[len - 2048..].to_string();
+                    }
+                }
+            }
+        });
+    }
 
     let (tx, rx) = async_channel::unbounded::<Ev>();
     if let Some(out) = stdout {
@@ -308,6 +459,19 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                     Err(_) => continue,
                 };
                 match v.get("type").and_then(|t| t.as_str()) {
+                    Some("system")
+                        if v.get("subtype").and_then(|s| s.as_str()) == Some("init") =>
+                    {
+                        let model =
+                            v.get("model").and_then(|x| x.as_str()).map(str::to_string);
+                        let session_id = v
+                            .get("session_id")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string);
+                        if tx.send_blocking(Ev::Init { model, session_id }).is_err() {
+                            break;
+                        }
+                    }
                     Some("result") => {
                         if tx.send_blocking(Ev::Turn(parse_result(&v))).is_err() {
                             break;
@@ -398,12 +562,29 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
     }
 
     let tab = tab.clone();
+    let errbuf_r = errbuf.clone();
     glib::spawn_future_local(async move {
         while let Ok(ev) = rx.recv().await {
             if tab.gen.get() != my_gen {
                 break; // a newer process superseded this one — stop silently
             }
             match ev {
+                Ev::Init { model, session_id } => {
+                    // A live init means this config is good: clear the
+                    // command-respawn rollback guard.
+                    let mut s = tab.sess.borrow_mut();
+                    if let Some(m) = model {
+                        s.model = Some(m);
+                    }
+                    if let Some(sid) = session_id {
+                        s.session_id = Some(sid);
+                    }
+                    if s.cmd_pending {
+                        s.cmd_pending = false;
+                        s.cmd_recovering = false;
+                        s.good_overrides = s.overrides.clone();
+                    }
+                }
                 Ev::Delta(t) => {
                     tab.stream.borrow_mut().push_str(&t);
                     schedule_render(&tab);
@@ -417,20 +598,20 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                 }
                 Ev::Turn(o) => {
                     tab.stream.borrow_mut().clear();
-                    let total = {
+                    {
                         let mut s = tab.sess.borrow_mut();
                         if let Some(sid) = o.session_id {
                             s.session_id = Some(sid);
                         }
-                        s.total_cost += o.cost;
-                        s.total_cost
-                    };
+                        s.last_usage = Some(o.usage);
+                        // Output proves the current config works.
+                        if s.cmd_pending {
+                            s.cmd_pending = false;
+                            s.cmd_recovering = false;
+                            s.good_overrides = s.overrides.clone();
+                        }
+                    }
                     push_msg(&tab, "Claude", &o.result);
-                    push_msg(
-                        &tab,
-                        "System",
-                        &format!("cost: this turn ${:.4}, session ${:.4}", o.cost, total),
-                    );
                     if !o.denials.is_empty() {
                         {
                             let mut s = tab.sess.borrow_mut();
@@ -452,13 +633,58 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                     }
                     tab.status.set_text("");
                     tab.entry.set_sensitive(true);
+                    tab.img.set_sensitive(true);
                     tab.send.set_sensitive(true);
                 }
                 Ev::Ended(why) => {
                     tab.stream.borrow_mut().clear();
-                    push_msg(&tab, "System", &format!("(session process ended: {why})"));
+                    // Rollback invariant (DESIGN): if a command-triggered
+                    // respawn dies before producing anything, the argument was
+                    // bad. Restore the last-good config and respawn once;
+                    // never leave the session dead over a typo.
+                    let (rollback, recovering) = {
+                        let s = tab.sess.borrow();
+                        (s.cmd_pending && !s.cmd_recovering, s.cmd_recovering)
+                    };
+                    let errtail = errbuf_r
+                        .lock()
+                        .ok()
+                        .map(|b| b.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    if rollback {
+                        {
+                            let mut s = tab.sess.borrow_mut();
+                            s.overrides = s.good_overrides.clone();
+                            s.cmd_pending = false;
+                            s.cmd_recovering = true;
+                        }
+                        let detail = errtail
+                            .as_deref()
+                            .unwrap_or("the process exited immediately");
+                        push_msg(
+                            &tab,
+                            "System",
+                            &format!(
+                                "Command rejected by the CLI — reverting to the \
+                                 previous config and continuing:\n{detail}"
+                            ),
+                        );
+                        spawn_proc(&tab, false);
+                        break;
+                    }
+                    let extra = if recovering {
+                        " (recovery also failed)"
+                    } else {
+                        ""
+                    };
+                    let msg = match &errtail {
+                        Some(e) => format!("(session process ended: {why}{extra})\n{e}"),
+                        None => format!("(session process ended: {why}{extra})"),
+                    };
+                    push_msg(&tab, "System", &msg);
                     tab.status.set_text("");
                     tab.entry.set_sensitive(false);
+                    tab.img.set_sensitive(false);
                     tab.send.set_sensitive(false);
                     break;
                 }
@@ -483,11 +709,151 @@ fn send_turn(tab: &Tab, message: &str) {
     if ok {
         tab.status.set_text("⏳ working…");
         tab.entry.set_sensitive(false);
+        tab.img.set_sensitive(false);
         tab.send.set_sensitive(false);
         tab.approve.set_sensitive(false);
     } else {
         push_msg(tab, "System", "Error: session process not running. Re-choose the folder.");
     }
+}
+
+fn cmd_help_text() -> String {
+    let mut s = String::from(
+        "Commands — anything else starting with / is sent to Claude verbatim:\n",
+    );
+    for c in COMMANDS {
+        s.push_str(&format!("  {:<22} {}\n", c.usage, c.help));
+    }
+    s.push_str(
+        "\nThe GUI does not validate values — the CLI does. /context and /cost \
+         are intentionally not provided (see DESIGN.md).",
+    );
+    s
+}
+
+fn status_text(tab: &Tab) -> String {
+    let s = tab.sess.borrow();
+    let model = s
+        .model
+        .clone()
+        .unwrap_or_else(|| "(unknown — send a message first)".into());
+    let sid = s.session_id.clone().unwrap_or_else(|| "(none yet)".into());
+    let pm = s
+        .overrides
+        .iter()
+        .find(|(f, _)| f == "--permission-mode")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| {
+            MODE_LABELS
+                .get(tab.mode.selected() as usize)
+                .copied()
+                .unwrap_or("?")
+                .to_string()
+        });
+    let ov = if s.overrides.is_empty() {
+        "(none)".to_string()
+    } else {
+        s.overrides
+            .iter()
+            .map(|(f, v)| format!("{f} {v}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let usage = match s.last_usage {
+        Some(u) => format!(
+            "last turn — input {} (cache: {} read / {} created), output {}\n  \
+             (no context-window size in the stream-json protocol → no % shown)",
+            u.input, u.cache_read, u.cache_create, u.output
+        ),
+        None => "last turn — (no usage yet)".to_string(),
+    };
+    format!(
+        "Status\n  model: {model}\n  session: {sid}\n  \
+         permission-mode: {pm}\n  overrides: {ov}\n  {usage}"
+    )
+}
+
+/// Returns true if the input was a recognised command (handled here); false
+/// for an unrecognised `/x`, which the caller sends as a normal message
+/// (Route D — custom `.claude/commands/*` keep working).
+fn handle_command(tab: &Tab, line: &str) -> bool {
+    let mut it = line.splitn(2, char::is_whitespace);
+    let name = it.next().unwrap_or("");
+    let arg = it.next().unwrap_or("").trim().to_string();
+    let cmd = match lookup_cmd(name) {
+        Some(c) => c,
+        None => return false,
+    };
+    match &cmd.route {
+        Route::Local(Local::Help) => push_msg(tab, "System", &cmd_help_text()),
+        Route::Local(Local::Status) => {
+            let t = status_text(tab);
+            push_msg(tab, "System", &t);
+        }
+        Route::Clear => {
+            if tab.sess.borrow().workdir.is_none() {
+                push_msg(tab, "System", "Choose a folder first.");
+                return true;
+            }
+            {
+                let mut s = tab.sess.borrow_mut();
+                s.session_id = None;
+                s.pending_approval = false;
+                s.pending_dirs.clear();
+                s.cmd_pending = false;
+                s.cmd_recovering = false;
+            }
+            tab.msgs.borrow_mut().clear();
+            tab.stream.borrow_mut().clear();
+            tab.approve.set_sensitive(false);
+            push_msg(
+                tab,
+                "System",
+                "Cleared — fresh session (previous context dropped).",
+            );
+            spawn_proc(tab, false);
+        }
+        Route::RespawnFlag(flag) => {
+            let flag: &str = flag;
+            if arg.is_empty() {
+                let cur = {
+                    let s = tab.sess.borrow();
+                    if flag == "--model" {
+                        s.model.clone()
+                    } else {
+                        s.overrides
+                            .iter()
+                            .find(|(f, _)| f == flag)
+                            .map(|(_, v)| v.clone())
+                    }
+                };
+                let cur = cur.unwrap_or_else(|| "(CLI default)".into());
+                push_msg(
+                    tab,
+                    "System",
+                    &format!("{name}: current = {cur}\nUsage: {}", cmd.usage),
+                );
+                return true;
+            }
+            if tab.sess.borrow().workdir.is_none() {
+                push_msg(tab, "System", "Choose a folder first.");
+                return true;
+            }
+            {
+                let mut s = tab.sess.borrow_mut();
+                set_override(&mut s, flag, &arg);
+                s.cmd_pending = true;
+                s.cmd_recovering = false;
+            }
+            push_msg(
+                tab,
+                "System",
+                &format!("{name} → {arg} (restarting session; context kept)"),
+            );
+            spawn_proc(tab, false);
+        }
+    }
+    true
 }
 
 fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget {
@@ -517,13 +883,19 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let entry = gtk::Entry::new();
     entry.set_hexpand(true);
-    entry.set_placeholder_text(Some("Message Claude Code…  (Enter to send)"));
+    entry.set_placeholder_text(Some(
+        "Message Claude Code…  (Enter to send · /help for commands)",
+    ));
     entry.set_sensitive(false);
+    let img = gtk::Button::with_label("📎 Image");
+    img.set_tooltip_text(Some("Paste an image from the clipboard and send it"));
+    img.set_sensitive(false);
     let approve = gtk::Button::with_label("Approve");
     approve.set_sensitive(false);
     let send = gtk::Button::with_label("Send");
     send.set_sensitive(false);
     bottom.append(&entry);
+    bottom.append(&img);
     bottom.append(&approve);
     bottom.append(&send);
 
@@ -540,6 +912,7 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
         gen: Rc::new(Cell::new(0)),
         web: web.clone(),
         entry: entry.clone(),
+        img: img.clone(),
         send: send.clone(),
         approve: approve.clone(),
         mode: mode.clone(),
@@ -574,6 +947,7 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
                         tab_fp.stream.borrow_mut().clear();
                         dir_label.set_text(&path.to_string_lossy());
                         tab_fp.entry.set_sensitive(true);
+                        tab_fp.img.set_sensitive(true);
                         tab_fp.send.set_sensitive(true);
                         tab_fp.approve.set_sensitive(false);
                         push_msg(
@@ -593,6 +967,13 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
         send.connect_clicked(move |_| {
             let msg = tab_s.entry.text().to_string();
             if msg.trim().is_empty() {
+                return;
+            }
+            // Route a leading `/` through the command dispatcher. A recognised
+            // command is consumed here; an unknown one falls through and is
+            // sent verbatim (Route D).
+            if msg.trim_start().starts_with('/') && handle_command(&tab_s, msg.trim()) {
+                tab_s.entry.set_text("");
                 return;
             }
             if tab_s.sess.borrow().stdin.is_none() {
@@ -633,6 +1014,66 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
             push_msg(&tab_a, "You", "[Approved — restarting session with access, continuing]");
             spawn_proc(&tab_a, true);
             send_turn(&tab_a, "Approved. Proceed with the action you described.");
+        });
+    }
+
+    // "📎 Image": read an image off the clipboard, write it into the session
+    // workdir as a dotfile (Read inside the workdir needs no permission), then
+    // send a turn that points Claude at the absolute path. Any text already in
+    // the entry rides along as the accompanying question.
+    {
+        let tab_i = tab.clone();
+        img.connect_clicked(move |b| {
+            let wd = match tab_i.sess.borrow().workdir.clone() {
+                Some(w) => w,
+                None => {
+                    push_msg(&tab_i, "System", "Choose a folder first.");
+                    return;
+                }
+            };
+            if tab_i.sess.borrow().stdin.is_none() {
+                push_msg(&tab_i, "System", "No running session.");
+                return;
+            }
+            let cb = b.clipboard();
+            let tab_c = tab_i.clone();
+            cb.read_texture_async(gtk::gio::Cancellable::NONE, move |res| match res {
+                Ok(Some(tex)) => {
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let fname = format!(".ccgui-paste-{ts}.png");
+                    let path = wd.join(&fname);
+                    match tex.save_to_png(&path) {
+                        Ok(()) => {
+                            let extra = tab_c.entry.text().to_string();
+                            tab_c.entry.set_text("");
+                            push_msg(
+                                &tab_c,
+                                "You",
+                                &format!("[pasted image: {fname}] {extra}"),
+                            );
+                            let p = path.to_string_lossy();
+                            let msg = format!(
+                                "我粘贴了一张图片，请先用 Read 工具查看这个文件，再回答：\n{p}\n{extra}"
+                            );
+                            send_turn(&tab_c, &msg);
+                        }
+                        Err(e) => push_msg(
+                            &tab_c,
+                            "System",
+                            &format!("Failed to save pasted image: {e}"),
+                        ),
+                    }
+                }
+                Ok(None) => {
+                    push_msg(&tab_c, "System", "Clipboard has no image.")
+                }
+                Err(e) => {
+                    push_msg(&tab_c, "System", &format!("Clipboard read failed: {e}"))
+                }
+            });
         });
     }
 
@@ -703,6 +1144,11 @@ fn build_ui(app: &Application) {
 }
 
 fn main() -> glib::ExitCode {
+    // Align the X11 WM_CLASS with APP_ID so GNOME associates the window with
+    // the installed .desktop (StartupWMClass=APP_ID) and shows its icon.
+    // Without this, `cargo run` yields WM_CLASS from the binary name and the
+    // dock falls back to a generic icon.
+    glib::set_prgname(Some(APP_ID));
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run()
