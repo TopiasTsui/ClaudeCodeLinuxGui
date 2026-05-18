@@ -19,9 +19,21 @@ official **Claude Code** CLI on Linux.
 - Treat v0.0.1 as a starting point to iterate against real `cargo build`
   output, not a finished app.
 
-## v0.0.1 boundaries (deliberate)
+## v0.1 scope (deliberate)
 
-- **Chat only** — tools disabled (`--tools ""`). No file edits / commands.
+- **File-editing tools enabled** (`Write,Edit,Read`). **No Bash / command
+  execution** — riskier, and `acceptEdits` behaviour for Bash was not verified.
+- **Permission handling** (grounded in CLI probes):
+  - Reading files **inside** the chosen folder: allowed automatically.
+  - Writing files, or reading/writing **outside** the chosen folder: the CLI
+    denies and reports it; the GUI shows what Claude needs and enables an
+    **Approve** button (typing does NOT grant permission).
+  - **Approve** resumes the session with `--permission-mode acceptEdits`
+    (covers writes/edits) **and** `--add-dir <dir>` for each denied path's
+    directory (covers out-of-folder access). Approved directories accumulate
+    and are re-sent on every later turn.
+  - **"Auto-approve edits"** checkbox: edits proceed without prompting (still
+    no out-of-folder access until something is approved).
 - **No streaming** — each turn waits for the full reply (`--output-format json`).
 - Reply text shown verbatim (may contain stray markup).
 
