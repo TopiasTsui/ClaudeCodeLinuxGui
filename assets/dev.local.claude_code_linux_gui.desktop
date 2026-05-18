@@ -5,4 +5,5 @@ Comment=Native GTK4 GUI for the official Claude Code CLI
 Exec=claude-code-linux-gui
 Icon=dev.local.claude_code_linux_gui
 Terminal=false
+StartupWMClass=dev.local.claude_code_linux_gui
 Categories=Development;Utility;

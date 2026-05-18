@@ -1,0 +1,31 @@
+# AppArmor profile for the Claude Code Linux GUI.
+#
+# Why this exists:
+#   WebKitGTK 6 always sandboxes its web/network processes with bubblewrap
+#   (`bwrap`), which needs an unprivileged user namespace. On Ubuntu 23.10+
+#   (apparmor >= 4.0.1, kernel.apparmor_restrict_unprivileged_userns=1) a
+#   process with no AppArmor profile is denied userns creation, so bwrap
+#   dies with "setting up uid map: Permission denied" and the app aborts.
+#
+# What this does:
+#   Attaches an otherwise-UNCONFINED profile to the app binary that does
+#   nothing except re-grant `userns`. The system-wide hardening stays on
+#   for every other unprofiled program; only this binary is exempted.
+#
+# Attachment covers: `cargo run` builds under $HOME (target/debug, target/
+# release), `cargo install` (~/.cargo/bin), ~/.local/bin, and system bins.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+@{exec_path} = @{HOME}/**/claude-code-linux-gui
+@{exec_path} += /usr/local/bin/claude-code-linux-gui
+@{exec_path} += /usr/bin/claude-code-linux-gui
+
+profile claude-code-linux-gui @{exec_path} flags=(unconfined) {
+  userns,
+
+  # Site-local overrides, if any.
+  include if exists <local/claude-code-linux-gui>
+}
