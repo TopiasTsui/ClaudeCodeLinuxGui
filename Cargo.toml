@@ -1,0 +1,15 @@
+[package]
+name = "claude-code-linux-gui"
+version = "0.0.1"
+edition = "2021"
+description = "A minimal, native (GTK4, no Electron) Linux GUI for the official Claude Code CLI. Not affiliated with Anthropic."
+
+# NOTE: versions below are best-effort and NOT verified by a compiler in the
+# environment where this was written (no Rust toolchain present there).
+# `cargo` will resolve; the compiler will surface any mismatch. Fix against
+# real `cargo build` output.
+[dependencies]
+gtk = { version = "0.9", package = "gtk4" }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+async-channel = "2"

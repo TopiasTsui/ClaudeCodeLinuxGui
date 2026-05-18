@@ -1,62 +1,47 @@
 # Claude Code — Linux GUI (v0.0.1)
 
-A minimal, free, open-source desktop GUI for the official **Claude Code** CLI on Linux.
+A minimal, **native** (GTK4, no Electron) free/open-source desktop GUI for the
+official **Claude Code** CLI on Linux.
 
-> Not affiliated with, endorsed by, or sponsored by Anthropic. This is an
-> independent wrapper around the official `claude` command-line tool.
+> Not affiliated with, endorsed by, or sponsored by Anthropic. Independent
+> wrapper around the official `claude` command-line tool.
 
-## What this is (and is not)
+## Honest status
 
-v0.0.1 is intentionally tiny. It does exactly one thing end to end:
+- The **CLI integration logic** (per-turn `--session-id` / `--resume`,
+  `--output-format json`, explicit `claude` path resolution) is grounded in
+  empirical probes of the installed CLI.
+- The **Rust/GTK4 code is UNVERIFIED**: it was written without a Rust
+  toolchain or GTK4 dev libraries available to compile or type-check it.
+  Expect to fix compile errors on first build. Most likely fix points are
+  marked `FRAGILE:` in `src/main.rs` (the file picker API and the
+  thread→UI channel are the usual version-churn spots in gtk4-rs).
+- Treat v0.0.1 as a starting point to iterate against real `cargo build`
+  output, not a finished app.
 
-1. Pick a working folder.
-2. Type a message.
-3. It runs the official `claude` CLI in that folder and shows the reply.
-4. Context is kept across messages within the session.
+## v0.0.1 boundaries (deliberate)
 
-**v0.0.1 known boundaries (deliberate, not bugs):**
+- **Chat only** — tools disabled (`--tools ""`). No file edits / commands.
+- **No streaming** — each turn waits for the full reply (`--output-format json`).
+- Reply text shown verbatim (may contain stray markup).
 
-- **Chat only — tools are disabled** (`--tools ""`). Claude will not edit
-  files or run commands yet. This avoids the GUI hanging on a permission
-  prompt it can't answer. Tool support is future work.
-- **No streaming.** Each turn waits for the full reply (`--output-format
-  json`). Token-by-token streaming is unverified and deferred.
-- The model's raw reply text may occasionally contain stray markup; v0.0.1
-  shows it verbatim.
+## Prerequisites (heavier than a web app — this is the cost of native)
 
-## How it works (grounded in tested CLI behavior)
+- A Rust toolchain — install via [rustup](https://rustup.rs).
+- GTK4 development libraries, e.g. on Debian/Ubuntu:
+  `sudo apt install libgtk-4-dev build-essential`
+- The official Claude Code CLI installed and authenticated (`claude`).
 
-- Each turn = one `claude -p <message> --output-format json` process.
-- First turn uses `--session-id <uuid>`; later turns use `--resume <uuid>`.
-  Context persistence across turns was verified empirically against the
-  installed CLI before this code was written.
-- The `claude` binary is resolved from explicit known locations, not just the
-  inherited `PATH`. This is a deliberate response to the most common failure
-  of existing Claude Code GUIs (desktop-launched process missing `PATH`,
-  e.g. `env: node: No such file or directory`). Override with `CLAUDE_BIN`.
-
-## Requirements
-
-- Linux
-- Node.js + npm
-- The official Claude Code CLI installed and authenticated (`claude`)
-
-## Run
+## Build & run
 
 ```bash
-npm install
-npm start
+cargo run
 ```
+
+First build will likely surface crate-version / API mismatches (the code is
+uncompiled — see "Honest status"). Paste the errors back to iterate.
 
 ## License
 
-**Not chosen yet (TBD).** No license file is included on purpose; until one
-is added, default copyright applies. Pick one before publishing/accepting
-contributions.
-
-## Status
-
-Early scaffold. The CLI-invocation logic is grounded in empirical probes of
-the installed `claude` CLI. The GUI itself has not been verified to render in
-the environment where it was scaffolded — run `npm start` on a Linux desktop
-to confirm.
+**Not chosen yet (TBD).** No license file included on purpose; default
+copyright applies until one is added.
