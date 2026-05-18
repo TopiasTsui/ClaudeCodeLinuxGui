@@ -25,6 +25,7 @@ const APP_ID: &str = "dev.local.claude_code_linux_gui";
 struct State {
     workdir: Option<PathBuf>,
     session_id: Option<String>,
+    total_cost: f64,
 }
 
 fn resolve_claude() -> String {
@@ -176,6 +177,7 @@ fn build_ui(app: &Application) {
                                 let mut s = state.borrow_mut();
                                 s.workdir = Some(path.clone());
                                 s.session_id = None; // new folder = new session
+                                s.total_cost = 0.0;
                             }
                             dir_label.set_text(&path.to_string_lossy());
                             entry.set_sensitive(true);
@@ -229,9 +231,19 @@ fn build_ui(app: &Application) {
             glib::spawn_future_local(async move {
                 if let Ok(res) = rx.recv().await {
                     match res {
-                        Ok((result, sid, _cost)) => {
-                            state.borrow_mut().session_id = Some(sid);
+                        Ok((result, sid, cost)) => {
+                            let total = {
+                                let mut s = state.borrow_mut();
+                                s.session_id = Some(sid);
+                                s.total_cost += cost;
+                                s.total_cost
+                            };
                             append(&buffer, "Claude", &result);
+                            append(
+                                &buffer,
+                                "System",
+                                &format!("cost: this turn ${cost:.4}, session ${total:.4}"),
+                            );
                         }
                         Err(e) => append(&buffer, "System", &format!("Error: {e}")),
                     }
