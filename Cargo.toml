@@ -9,7 +9,7 @@ description = "A minimal, native (GTK4, no Electron) Linux GUI for the official 
 # `cargo` will resolve; the compiler will surface any mismatch. Fix against
 # real `cargo build` output.
 [dependencies]
-gtk = { version = "0.9", package = "gtk4" }
+gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 async-channel = "2"

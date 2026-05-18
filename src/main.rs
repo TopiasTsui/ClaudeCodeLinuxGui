@@ -150,8 +150,8 @@ fn build_ui(app: &Application) {
         .build();
 
     // ---- Folder picker ----
-    // FRAGILE: FileChooserNative is deprecated in newer gtk4-rs in favor of
-    // gtk::FileDialog. If this errors, switch to FileDialog.
+    // Uses the modern gtk::FileDialog (GTK 4.10+). The older FileChooserNative
+    // triggers `GTK_IS_FILE_SYSTEM_MODEL` criticals on current GTK4.
     {
         let state = state.clone();
         let entry = entry.clone();
@@ -160,35 +160,31 @@ fn build_ui(app: &Application) {
         let buffer = buffer.clone();
         let window = window.clone();
         pick.connect_clicked(move |_| {
-            let chooser = gtk::FileChooserNative::new(
-                Some("Choose folder"),
-                Some(&window),
-                gtk::FileChooserAction::SelectFolder,
-                Some("Select"),
-                Some("Cancel"),
-            );
+            let dialog = gtk::FileDialog::builder().title("Choose folder").build();
             let state = state.clone();
             let entry = entry.clone();
             let send = send.clone();
             let dir_label = dir_label.clone();
             let buffer = buffer.clone();
-            chooser.connect_response(move |c, resp| {
-                if resp == gtk::ResponseType::Accept {
-                    if let Some(path) = c.file().and_then(|f| f.path()) {
-                        {
-                            let mut s = state.borrow_mut();
-                            s.workdir = Some(path.clone());
-                            s.session_id = None; // new folder = new session
+            dialog.select_folder(
+                Some(&window),
+                gtk::gio::Cancellable::NONE,
+                move |res| {
+                    if let Ok(file) = res {
+                        if let Some(path) = file.path() {
+                            {
+                                let mut s = state.borrow_mut();
+                                s.workdir = Some(path.clone());
+                                s.session_id = None; // new folder = new session
+                            }
+                            dir_label.set_text(&path.to_string_lossy());
+                            entry.set_sensitive(true);
+                            send.set_sensitive(true);
+                            append(&buffer, "System", "Folder set. New session. Chat-only in v0.0.1 (tools disabled).");
                         }
-                        dir_label.set_text(&path.to_string_lossy());
-                        entry.set_sensitive(true);
-                        send.set_sensitive(true);
-                        append(&buffer, "System", "Folder set. New session. Chat-only in v0.0.1 (tools disabled).");
                     }
-                }
-                c.destroy();
-            });
-            chooser.show();
+                },
+            );
         });
     }
 
