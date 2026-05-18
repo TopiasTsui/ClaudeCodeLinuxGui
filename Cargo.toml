@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-linux-gui"
-version = "0.5.0"
+version = "0.5.2"
 edition = "2021"
 description = "A native (GTK4, no Electron) Linux GUI for the official Claude Code CLI: persistent per-session process, streaming output, multi-session, per-session permission mode, full tools, Markdown rendering. Not affiliated with Anthropic."
 

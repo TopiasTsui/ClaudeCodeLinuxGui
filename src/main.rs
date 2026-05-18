@@ -73,6 +73,8 @@ struct TurnResult {
 
 enum Ev {
     Delta(String),
+    Tool(String),
+    Thinking,
     Turn(TurnResult),
     Ended(String),
 }
@@ -108,6 +110,11 @@ fn render(tab: &Tab) {
     let live = tab.stream.borrow();
     let mut body = String::new();
     for (who, text) in msgs.iter() {
+        if who == "Tool" {
+            // Compact live activity line, no header.
+            body.push_str(&format!("<div class=\"tool\">{}</div>", esc(text)));
+            continue;
+        }
         let cls = match who.as_str() {
             "You" => "user",
             "Claude" => "claude",
@@ -138,6 +145,8 @@ fn render(tab: &Tab) {
          .user pre,.system pre{{white-space:pre-wrap;word-break:break-word;margin:0;\
          font-family:ui-monospace,monospace}}\
          .user pre{{color:#9cdcfe}}.system{{color:#c5915f;font-style:italic}}\
+         .tool{{color:#7fae7f;font-family:ui-monospace,monospace;font-size:12px;\
+         margin:2px 0;white-space:pre-wrap;word-break:break-word}}\
          code{{background:#2d2d2d;padding:1px 4px;border-radius:3px;\
          font-family:ui-monospace,monospace}}\
          pre code{{display:block;padding:10px;overflow-x:auto}}\
@@ -169,6 +178,10 @@ struct Tab {
     msgs: Rc<RefCell<Vec<(String, String)>>>,
     stream: Rc<RefCell<String>>,
     render_pending: Rc<Cell<bool>>,
+    // Process generation: bumped on every (re)spawn. A receiver loop for a
+    // superseded process stops silently instead of disabling the UI / printing
+    // a spurious "session ended".
+    gen: Rc<Cell<u64>>,
     web: webkit6::WebView,
     entry: gtk::Entry,
     send: gtk::Button,
@@ -230,6 +243,9 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
             None => return,
         }
     };
+    // New generation; supersedes any previous process's receiver loop.
+    let my_gen = tab.gen.get().wrapping_add(1);
+    tab.gen.set(my_gen);
     {
         let mut s = tab.sess.borrow_mut();
         s.stdin = None;
@@ -297,28 +313,75 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                             break;
                         }
                     }
-                    Some("stream_event") => {
-                        let e = v.get("event");
-                        let is_delta = e
-                            .and_then(|e| e.get("type"))
-                            .and_then(|t| t.as_str())
-                            == Some("content_block_delta");
-                        if is_delta {
-                            if let Some(t) = e
-                                .and_then(|e| e.get("delta"))
-                                .filter(|d| {
-                                    d.get("type").and_then(|t| t.as_str())
-                                        == Some("text_delta")
-                                })
-                                .and_then(|d| d.get("text"))
-                                .and_then(|x| x.as_str())
-                            {
-                                if !t.is_empty()
-                                    && tx.send_blocking(Ev::Delta(t.to_string())).is_err()
+                    Some("assistant") => {
+                        if let Some(content) = v
+                            .get("message")
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_array())
+                        {
+                            for blk in content {
+                                if blk.get("type").and_then(|t| t.as_str())
+                                    != Some("tool_use")
                                 {
+                                    continue;
+                                }
+                                let name =
+                                    blk.get("name").and_then(|x| x.as_str()).unwrap_or("tool");
+                                let inp = blk.get("input");
+                                let tgt = inp
+                                    .and_then(|i| i.get("command"))
+                                    .and_then(|x| x.as_str())
+                                    .or_else(|| {
+                                        inp.and_then(|i| i.get("file_path"))
+                                            .and_then(|x| x.as_str())
+                                    })
+                                    .or_else(|| {
+                                        inp.and_then(|i| i.get("path"))
+                                            .and_then(|x| x.as_str())
+                                    })
+                                    .unwrap_or("");
+                                let mut tgt = tgt.replace('\n', " ");
+                                if tgt.chars().count() > 120 {
+                                    tgt = tgt.chars().take(120).collect::<String>() + "…";
+                                }
+                                let label = if tgt.is_empty() {
+                                    format!("🔧 {name}")
+                                } else {
+                                    format!("🔧 {name}: {tgt}")
+                                };
+                                if tx.send_blocking(Ev::Tool(label)).is_err() {
                                     break;
                                 }
                             }
+                        }
+                    }
+                    Some("stream_event") => {
+                        let delta = v
+                            .get("event")
+                            .filter(|e| {
+                                e.get("type").and_then(|t| t.as_str())
+                                    == Some("content_block_delta")
+                            })
+                            .and_then(|e| e.get("delta"));
+                        match delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()) {
+                            Some("text_delta") => {
+                                if let Some(t) = delta
+                                    .and_then(|d| d.get("text"))
+                                    .and_then(|x| x.as_str())
+                                {
+                                    if !t.is_empty()
+                                        && tx
+                                            .send_blocking(Ev::Delta(t.to_string()))
+                                            .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            Some("thinking_delta") => {
+                                let _ = tx.send_blocking(Ev::Thinking);
+                            }
+                            _ => {}
                         }
                     }
                     _ => {}
@@ -337,10 +400,20 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
     let tab = tab.clone();
     glib::spawn_future_local(async move {
         while let Ok(ev) = rx.recv().await {
+            if tab.gen.get() != my_gen {
+                break; // a newer process superseded this one — stop silently
+            }
             match ev {
                 Ev::Delta(t) => {
                     tab.stream.borrow_mut().push_str(&t);
                     schedule_render(&tab);
+                }
+                Ev::Tool(label) => {
+                    tab.status.set_text("🔧 working…");
+                    push_msg(&tab, "Tool", &label);
+                }
+                Ev::Thinking => {
+                    tab.status.set_text("💭 thinking…");
                 }
                 Ev::Turn(o) => {
                     tab.stream.borrow_mut().clear();
@@ -464,6 +537,7 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
         msgs: Rc::new(RefCell::new(Vec::new())),
         stream: Rc::new(RefCell::new(String::new())),
         render_pending: Rc::new(Cell::new(false)),
+        gen: Rc::new(Cell::new(0)),
         web: web.clone(),
         entry: entry.clone(),
         send: send.clone(),
@@ -600,13 +674,22 @@ fn build_ui(app: &Application) {
     vbox.append(&toolbar);
     vbox.append(&notebook);
 
+    // Make the bundled SVG resolvable by name. NOTE: a reliable dock/taskbar
+    // icon on Linux comes from the installed .desktop + themed icon
+    // (packaging); this runtime path is best-effort and compositor-dependent.
+    if let Some(disp) = gtk::gdk::Display::default() {
+        gtk::IconTheme::for_display(&disp)
+            .add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+    }
+
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Claude Code — Linux GUI (v0.5.0)")
+        .title("Claude Code — Linux GUI (v0.5.2)")
         .default_width(1100)
         .default_height(780)
         .child(&vbox)
         .build();
+    window.set_icon_name(Some(APP_ID));
 
     {
         let notebook = notebook.clone();

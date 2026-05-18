@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Code Linux GUI
+Comment=Native GTK4 GUI for the official Claude Code CLI
+Exec=claude-code-linux-gui
+Icon=dev.local.claude_code_linux_gui
+Terminal=false
+Categories=Development;Utility;
