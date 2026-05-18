@@ -19,7 +19,22 @@ official **Claude Code** CLI on Linux.
 - Treat v0.0.1 as a starting point to iterate against real `cargo build`
   output, not a finished app.
 
-## v0.1 scope (deliberate)
+## v0.2 scope
+
+- **Multiple sessions** — tabbed (`➕ New session`); each tab is an
+  independent conversation (own folder, history, cost, approved dirs).
+- **Per-session permission mode** — dropdown: `Ask (default)` / `Plan` /
+  `Accept edits` / `Auto`. Maps to `--permission-mode plan|acceptEdits|auto`
+  (Ask = none). **This dropdown is the safety control.** `Plan`/`Auto`
+  exact `-p` behaviour is not yet verified.
+- **All tools enabled** — Bash, Write, Edit, Read, etc. No `--tools`
+  restriction. This is a real agent harness on your own machine: it can run
+  commands and write code. Governed by the per-session mode.
+- In `Ask` mode, a denied action shows what Claude wants (file path *or* the
+  exact shell command) and an **Approve** button; approving resumes with
+  `acceptEdits` + accumulated `--add-dir`.
+
+## v0.1 scope (superseded — see v0.2 above)
 
 - **File-editing tools enabled** (`Write,Edit,Read`). **No Bash / command
   execution** — riskier, and `acceptEdits` behaviour for Bash was not verified.
