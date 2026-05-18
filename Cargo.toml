@@ -1,8 +1,8 @@
 [package]
 name = "claude-code-linux-gui"
-version = "0.2.0"
+version = "0.5.0"
 edition = "2021"
-description = "A native (GTK4, no Electron) Linux GUI for the official Claude Code CLI: multi-session, per-session permission mode, full tools. Not affiliated with Anthropic."
+description = "A native (GTK4, no Electron) Linux GUI for the official Claude Code CLI: persistent per-session process, streaming output, multi-session, per-session permission mode, full tools, Markdown rendering. Not affiliated with Anthropic."
 
 # NOTE: versions below are best-effort and NOT verified by a compiler in the
 # environment where this was written (no Rust toolchain present there).
@@ -13,4 +13,5 @@ gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 async-channel = "2"
-wait-timeout = "0.2"
+webkit6 = "0.4"
+pulldown-cmark = "0.12"

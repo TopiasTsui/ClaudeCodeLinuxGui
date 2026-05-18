@@ -1,40 +1,38 @@
-// Claude Code — Linux GUI (v0.2.0) — native GTK4, no Electron.
+// Claude Code — Linux GUI (v0.5.0) — native GTK4, no Electron.
 //
-// UNVERIFIED BUILD: written without a Rust toolchain / GTK4 dev libs to compile
-// or type-check. Large rewrite (multi-session + per-session mode + full tools).
-// Expect several `cargo build` iterations. Risk spots marked `FRAGILE:`.
+// Persistent process + STREAMING render (the real fix for "feels slow"):
+//   console streams tokens so it feels instant even when a turn takes long;
+//   we now do the same — consume `content_block_delta` text deltas and render
+//   progressively (debounced ~150ms), then finalize on the `result` event.
+//   Requires `--include-partial-messages`.
 //
-// Grounded in empirical probes of the installed `claude`:
-//   * per-turn `--session-id` / `--resume`, `--output-format json`        (verified)
-//   * default perm -> structured `permission_denials`                     (verified)
-//     - file ops carry tool_input.file_path; Bash carries tool_input.command
-//   * Read inside workdir auto-allowed; outside denied, fixed `--add-dir`  (verified)
-//   * Write denied by default; resume + acceptEdits runs it               (verified)
-//   * Bash denied by default; resume + acceptEdits RUNS it                (verified)
-//   * approved dirs must be re-passed every turn (fresh process each turn) (verified)
-// UNVERIFIED: exact behaviour of `--permission-mode plan` and `auto` under
-// `-p`; the multi-tool default toolset is left unrestricted (no `--tools`).
+// Verified by probes: persistent stream-json process keeps one session and
+// carries context; input line schema
+//   {"type":"user","message":{"role":"user","content":"..."}}
+// stream events: stream_event/content_block_delta(text_delta) -> incremental
+// text; `result` ends the turn (text/cost/session_id/permission_denials).
 //
-// Tools: unrestricted (Bash/Write/Edit/Read/...) — governed by the per-session
-// permission mode. This is a real agent harness on your own machine; the mode
-// dropdown is the safety control.
+// One long-lived `claude` per tab; permission-mode/--add-dir are launch flags
+// so approve & mode-change restart with `--resume <sid>` (context carries).
+//
+// UNVERIFIED at runtime: concurrency + streaming render. Compiles; runtime
+// needs `cargo run`.
 //
 // Not affiliated with, endorsed by, or sponsored by Anthropic.
 
-use std::cell::RefCell;
-use std::io::Read;
+use std::cell::{Cell, RefCell};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::{glib, Application, ApplicationWindow};
-use wait_timeout::ChildExt;
+use webkit6::prelude::*;
 
 const APP_ID: &str = "dev.local.claude_code_linux_gui";
 
-// Dropdown index -> permission-mode flag value (None = CLI default / "ask").
 const MODE_LABELS: [&str; 4] = ["Ask (default)", "Plan", "Accept edits", "Auto"];
 fn mode_flag(idx: u32) -> Option<&'static str> {
     match idx {
@@ -65,6 +63,20 @@ fn resolve_claude() -> String {
     "claude".to_string()
 }
 
+struct TurnResult {
+    result: String,
+    session_id: Option<String>,
+    cost: f64,
+    denials: Vec<String>,
+    denied_dirs: Vec<String>,
+}
+
+enum Ev {
+    Delta(String),
+    Turn(TurnResult),
+    Ended(String),
+}
+
 #[derive(Default)]
 struct Session {
     workdir: Option<PathBuf>,
@@ -73,105 +85,110 @@ struct Session {
     pending_approval: bool,
     pending_dirs: Vec<String>,
     allowed_dirs: Vec<String>,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
 }
 
-struct TurnOutcome {
-    result: String,
-    session_id: String,
-    cost: f64,
-    denials: Vec<String>,
-    denied_dirs: Vec<String>,
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-fn run_claude_turn(
-    bin: &str,
-    workdir: &PathBuf,
-    session_id: &Option<String>,
-    message: &str,
-    permission_mode: Option<&str>,
-    allowed_dirs: &[String],
-) -> Result<TurnOutcome, String> {
-    let new_sid = uuid::Uuid::new_v4().to_string();
-    let mut cmd = Command::new(bin);
-    cmd.arg("-p")
-        .arg(message)
-        .arg("--output-format")
-        .arg("json")
-        .current_dir(workdir);
-    match session_id {
-        Some(sid) => {
-            cmd.arg("--resume").arg(sid);
-        }
-        None => {
-            cmd.arg("--session-id").arg(&new_sid);
-        }
-    }
-    if let Some(m) = permission_mode {
-        cmd.arg("--permission-mode").arg(m);
-    }
-    for d in allowed_dirs {
-        cmd.arg("--add-dir").arg(d);
-    }
-    // FRAGILE: spawn + drain pipes on threads + wait_timeout. Highest-risk
-    // block to iterate against the compiler.
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to launch claude ({bin}): {e}"))?;
-    let mut co = child.stdout.take().expect("piped stdout");
-    let mut ce = child.stderr.take().expect("piped stderr");
-    let h_out = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = co.read_to_end(&mut b);
-        b
-    });
-    let h_err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = ce.read_to_end(&mut b);
-        b
-    });
-    // Generous: only a safety net for a TRUE hang, not a cap on legit long
-    // turns (real-repo turns can take minutes).
-    let status = match child
-        .wait_timeout(Duration::from_secs(600))
-        .map_err(|e| format!("wait error: {e}"))?
-    {
-        Some(s) => s,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(
-                "Timed out after 600s (process killed). The turn hung or ran too long.".to_string(),
-            );
-        }
-    };
-    let out_bytes = h_out.join().unwrap_or_default();
-    let err_bytes = h_err.join().unwrap_or_default();
-    if !status.success() {
-        let err = String::from_utf8_lossy(&err_bytes);
-        return Err(if err.trim().is_empty() {
-            format!("claude exited with status {status}")
+fn md_to_html(md: &str) -> String {
+    let mut opts = pulldown_cmark::Options::empty();
+    opts.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    opts.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+    let parser = pulldown_cmark::Parser::new_ext(md, opts);
+    let mut out = String::new();
+    pulldown_cmark::html::push_html(&mut out, parser);
+    out
+}
+
+fn render(tab: &Tab) {
+    let msgs = tab.msgs.borrow();
+    let live = tab.stream.borrow();
+    let mut body = String::new();
+    for (who, text) in msgs.iter() {
+        let cls = match who.as_str() {
+            "You" => "user",
+            "Claude" => "claude",
+            _ => "system",
+        };
+        let inner = if who == "Claude" {
+            md_to_html(text)
         } else {
-            err.trim().to_string()
-        });
+            format!("<pre>{}</pre>", esc(text))
+        };
+        body.push_str(&format!(
+            "<div class=\"msg {cls}\"><div class=\"who\">{}</div>{}</div>",
+            esc(who),
+            inner
+        ));
     }
-    let stdout = String::from_utf8_lossy(&out_bytes);
-    let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
-        format!(
-            "Could not parse claude JSON: {e}\n{}",
-            stdout.chars().take(500).collect::<String>()
-        )
-    })?;
+    if !live.is_empty() {
+        body.push_str(&format!(
+            "<div class=\"msg claude\"><div class=\"who\">Claude</div>{}</div>",
+            md_to_html(&live)
+        ));
+    }
+    let doc = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
+         body{{background:#1e1e1e;color:#e0e0e0;font-family:system-ui,sans-serif;\
+         margin:0;padding:16px;font-size:14px;line-height:1.55}}\
+         .msg{{margin-bottom:18px}}.who{{font-size:12px;color:#888;margin-bottom:4px}}\
+         .user pre,.system pre{{white-space:pre-wrap;word-break:break-word;margin:0;\
+         font-family:ui-monospace,monospace}}\
+         .user pre{{color:#9cdcfe}}.system{{color:#c5915f;font-style:italic}}\
+         code{{background:#2d2d2d;padding:1px 4px;border-radius:3px;\
+         font-family:ui-monospace,monospace}}\
+         pre code{{display:block;padding:10px;overflow-x:auto}}\
+         table{{border-collapse:collapse;margin:8px 0}}\
+         th,td{{border:1px solid #444;padding:4px 8px}}th{{background:#2d2d2d}}\
+         a{{color:#4ea1ff}}</style></head><body>{body}\
+         <script>window.scrollTo(0,1e9);</script></body></html>"
+    );
+    tab.web.load_html(&doc, None);
+}
+
+// Debounced render: coalesce streaming deltas to ~150ms to avoid reload storms.
+fn schedule_render(tab: &Tab) {
+    if tab.render_pending.get() {
+        return;
+    }
+    tab.render_pending.set(true);
+    let tab = tab.clone();
+    glib::timeout_add_local_once(Duration::from_millis(150), move || {
+        tab.render_pending.set(false);
+        render(&tab);
+    });
+}
+
+#[derive(Clone)]
+struct Tab {
+    sess: Rc<RefCell<Session>>,
+    bin: Rc<String>,
+    msgs: Rc<RefCell<Vec<(String, String)>>>,
+    stream: Rc<RefCell<String>>,
+    render_pending: Rc<Cell<bool>>,
+    web: webkit6::WebView,
+    entry: gtk::Entry,
+    send: gtk::Button,
+    approve: gtk::Button,
+    mode: gtk::DropDown,
+    status: gtk::Label,
+}
+
+fn push_msg(tab: &Tab, who: &str, text: &str) {
+    tab.msgs.borrow_mut().push((who.to_string(), text.to_string()));
+    render(tab);
+}
+
+fn parse_result(v: &serde_json::Value) -> TurnResult {
     let result = v
         .get("result")
         .and_then(|x| x.as_str())
         .unwrap_or("(empty response)")
         .to_string();
-    let sid = v
-        .get("session_id")
-        .and_then(|x| x.as_str())
-        .map(str::to_string)
-        .unwrap_or(new_sid);
+    let session_id = v.get("session_id").and_then(|x| x.as_str()).map(str::to_string);
     let cost = v.get("total_cost_usd").and_then(|x| x.as_f64()).unwrap_or(0.0);
     let mut denials = Vec::new();
     let mut denied_dirs = Vec::new();
@@ -202,107 +219,205 @@ fn run_claude_turn(
             }
         }
     }
-    Ok(TurnOutcome { result, session_id: sid, cost, denials, denied_dirs })
+    TurnResult { result, session_id, cost, denials, denied_dirs }
 }
 
-fn append(buffer: &gtk::TextBuffer, who: &str, text: &str) {
-    let mut end = buffer.end_iter();
-    buffer.insert(&mut end, &format!("\n{who}:\n{text}\n"));
-}
-
-#[derive(Clone)]
-struct Tab {
-    sess: Rc<RefCell<Session>>,
-    bin: Rc<String>,
-    buffer: gtk::TextBuffer,
-    entry: gtk::Entry,
-    send: gtk::Button,
-    approve: gtk::Button,
-    mode: gtk::DropDown,
-    status: gtk::Label,
-}
-
-fn start_turn(tab: &Tab, message: String, force_accept_edits: bool) {
-    let (workdir, session_id, allowed_dirs) = {
+fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
+    let (workdir, resume_sid, allowed_dirs) = {
         let s = tab.sess.borrow();
         match &s.workdir {
             Some(w) => (w.clone(), s.session_id.clone(), s.allowed_dirs.clone()),
             None => return,
         }
     };
-    let permission_mode = if force_accept_edits {
+    {
+        let mut s = tab.sess.borrow_mut();
+        s.stdin = None;
+        if let Some(mut c) = s.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    let pm = if force_accept_edits {
         Some("acceptEdits")
     } else {
         mode_flag(tab.mode.selected())
     };
 
-    tab.entry.set_sensitive(false);
-    tab.send.set_sensitive(false);
-    tab.approve.set_sensitive(false);
-    tab.status.set_text("⏳ working…");
+    let mut cmd = Command::new(&**tab.bin);
+    cmd.arg("-p")
+        .arg("--input-format")
+        .arg("stream-json")
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .arg("--include-partial-messages")
+        .current_dir(&workdir);
+    if let Some(sid) = &resume_sid {
+        cmd.arg("--resume").arg(sid);
+    }
+    if let Some(m) = pm {
+        cmd.arg("--permission-mode").arg(m);
+    }
+    for d in &allowed_dirs {
+        cmd.arg("--add-dir").arg(d);
+    }
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
 
-    // FRAGILE: thread -> UI handoff (async-channel + spawn_future_local).
-    let (tx, rx) = async_channel::bounded(1);
-    let bin = (*tab.bin).clone();
-    let pm = permission_mode.map(str::to_string);
-    std::thread::spawn(move || {
-        let res = run_claude_turn(
-            &bin,
-            &workdir,
-            &session_id,
-            &message,
-            pm.as_deref(),
-            &allowed_dirs,
-        );
-        let _ = tx.send_blocking(res);
-    });
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            push_msg(tab, "System", &format!("Failed to launch claude: {e}"));
+            return;
+        }
+    };
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+
+    let (tx, rx) = async_channel::unbounded::<Ev>();
+    if let Some(out) = stdout {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(out);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some("result") => {
+                        if tx.send_blocking(Ev::Turn(parse_result(&v))).is_err() {
+                            break;
+                        }
+                    }
+                    Some("stream_event") => {
+                        let e = v.get("event");
+                        let is_delta = e
+                            .and_then(|e| e.get("type"))
+                            .and_then(|t| t.as_str())
+                            == Some("content_block_delta");
+                        if is_delta {
+                            if let Some(t) = e
+                                .and_then(|e| e.get("delta"))
+                                .filter(|d| {
+                                    d.get("type").and_then(|t| t.as_str())
+                                        == Some("text_delta")
+                                })
+                                .and_then(|d| d.get("text"))
+                                .and_then(|x| x.as_str())
+                            {
+                                if !t.is_empty()
+                                    && tx.send_blocking(Ev::Delta(t.to_string())).is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let _ = tx.send_blocking(Ev::Ended("stream closed".into()));
+        });
+    }
+
+    {
+        let mut s = tab.sess.borrow_mut();
+        s.child = Some(child);
+        s.stdin = stdin;
+    }
 
     let tab = tab.clone();
     glib::spawn_future_local(async move {
-        match rx.recv().await {
-            Ok(Ok(o)) => {
-                let total = {
-                    let mut s = tab.sess.borrow_mut();
-                    s.session_id = Some(o.session_id);
-                    s.total_cost += o.cost;
-                    s.total_cost
-                };
-                append(&tab.buffer, "Claude", &o.result);
-                append(
-                    &tab.buffer,
-                    "System",
-                    &format!("cost: this turn ${:.4}, session ${:.4}", o.cost, total),
-                );
-                if !o.denials.is_empty() {
-                    {
+        while let Ok(ev) = rx.recv().await {
+            match ev {
+                Ev::Delta(t) => {
+                    tab.stream.borrow_mut().push_str(&t);
+                    schedule_render(&tab);
+                }
+                Ev::Turn(o) => {
+                    tab.stream.borrow_mut().clear();
+                    let total = {
                         let mut s = tab.sess.borrow_mut();
-                        s.pending_approval = true;
-                        s.pending_dirs = o.denied_dirs.clone();
-                    }
-                    append(
-                        &tab.buffer,
+                        if let Some(sid) = o.session_id {
+                            s.session_id = Some(sid);
+                        }
+                        s.total_cost += o.cost;
+                        s.total_cost
+                    };
+                    push_msg(&tab, "Claude", &o.result);
+                    push_msg(
+                        &tab,
                         "System",
-                        &format!(
-                            "Claude needs permission for:\n  {}\n\
-                             >>> Click [Approve] to allow and continue. Typing does NOT grant it. <<<",
-                            o.denials.join("\n  ")
-                        ),
+                        &format!("cost: this turn ${:.4}, session ${:.4}", o.cost, total),
                     );
-                    tab.approve.set_sensitive(true);
-                } else {
-                    tab.sess.borrow_mut().pending_approval = false;
+                    if !o.denials.is_empty() {
+                        {
+                            let mut s = tab.sess.borrow_mut();
+                            s.pending_approval = true;
+                            s.pending_dirs = o.denied_dirs.clone();
+                        }
+                        push_msg(
+                            &tab,
+                            "System",
+                            &format!(
+                                "Claude needs permission for:\n  {}\n\
+                                 >>> Click [Approve] to allow and continue. Typing does NOT grant it. <<<",
+                                o.denials.join("\n  ")
+                            ),
+                        );
+                        tab.approve.set_sensitive(true);
+                    } else {
+                        tab.sess.borrow_mut().pending_approval = false;
+                    }
+                    tab.status.set_text("");
+                    tab.entry.set_sensitive(true);
+                    tab.send.set_sensitive(true);
+                }
+                Ev::Ended(why) => {
+                    tab.stream.borrow_mut().clear();
+                    push_msg(&tab, "System", &format!("(session process ended: {why})"));
+                    tab.status.set_text("");
+                    tab.entry.set_sensitive(false);
+                    tab.send.set_sensitive(false);
+                    break;
                 }
             }
-            Ok(Err(e)) => append(&tab.buffer, "System", &format!("Error: {e}")),
-            Err(_) => append(&tab.buffer, "System", "Error: worker channel closed"),
         }
-        tab.status.set_text("");
-        tab.entry.set_sensitive(true);
-        tab.send.set_sensitive(true);
     });
 }
 
-fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> (gtk::Widget, String) {
+fn send_turn(tab: &Tab, message: &str) {
+    let line = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content": message}
+    })
+    .to_string();
+    let mut s = tab.sess.borrow_mut();
+    let ok = if let Some(si) = s.stdin.as_mut() {
+        writeln!(si, "{line}").and_then(|_| si.flush()).is_ok()
+    } else {
+        false
+    };
+    drop(s);
+    if ok {
+        tab.status.set_text("⏳ working…");
+        tab.entry.set_sensitive(false);
+        tab.send.set_sensitive(false);
+        tab.approve.set_sensitive(false);
+    } else {
+        push_msg(tab, "System", "Error: session process not running. Re-choose the folder.");
+    }
+}
+
+fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget {
     let sess = Rc::new(RefCell::new(Session::default()));
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -323,13 +438,8 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> (gtk::Widge
     top.append(&mode);
     top.append(&status);
 
-    let scroll = gtk::ScrolledWindow::new();
-    scroll.set_vexpand(true);
-    let view = gtk::TextView::new();
-    view.set_editable(false);
-    view.set_wrap_mode(gtk::WrapMode::WordChar);
-    scroll.set_child(Some(&view));
-    let buffer = view.buffer();
+    let web = webkit6::WebView::new();
+    web.set_vexpand(true);
 
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let entry = gtk::Entry::new();
@@ -345,59 +455,65 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> (gtk::Widge
     bottom.append(&send);
 
     root.append(&top);
-    root.append(&scroll);
+    root.append(&web);
     root.append(&bottom);
 
     let tab = Tab {
         sess: sess.clone(),
         bin,
-        buffer: buffer.clone(),
+        msgs: Rc::new(RefCell::new(Vec::new())),
+        stream: Rc::new(RefCell::new(String::new())),
+        render_pending: Rc::new(Cell::new(false)),
+        web: web.clone(),
         entry: entry.clone(),
         send: send.clone(),
         approve: approve.clone(),
         mode: mode.clone(),
         status: status.clone(),
     };
+    render(&tab);
 
-    // Folder picker
     {
-        let sess = sess.clone();
         let tab_fp = tab.clone();
         let dir_label = dir_label.clone();
-        let buffer = buffer.clone();
         let window = window.clone();
         pick.connect_clicked(move |_| {
             let dialog = gtk::FileDialog::builder().title("Choose folder").build();
-            let sess = sess.clone();
             let tab_fp = tab_fp.clone();
             let dir_label = dir_label.clone();
-            let buffer = buffer.clone();
             dialog.select_folder(Some(&window), gtk::gio::Cancellable::NONE, move |res| {
                 if let Ok(file) = res {
                     if let Some(path) = file.path() {
                         {
-                            let mut s = sess.borrow_mut();
+                            let mut s = tab_fp.sess.borrow_mut();
+                            s.stdin = None;
+                            if let Some(mut c) = s.child.take() {
+                                let _ = c.kill();
+                                let _ = c.wait();
+                            }
                             *s = Session {
                                 workdir: Some(path.clone()),
                                 ..Session::default()
                             };
                         }
+                        tab_fp.msgs.borrow_mut().clear();
+                        tab_fp.stream.borrow_mut().clear();
                         dir_label.set_text(&path.to_string_lossy());
                         tab_fp.entry.set_sensitive(true);
                         tab_fp.send.set_sensitive(true);
                         tab_fp.approve.set_sensitive(false);
-                        append(
-                            &buffer,
+                        push_msg(
+                            &tab_fp,
                             "System",
-                            "Folder set. New session. All tools enabled; permission governed by the mode dropdown.",
+                            "Folder set. Persistent session started; streaming on.",
                         );
+                        spawn_proc(&tab_fp, false);
                     }
                 }
             });
         });
     }
 
-    // Send
     {
         let tab_s = tab.clone();
         send.connect_clicked(move |_| {
@@ -405,9 +521,13 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> (gtk::Widge
             if msg.trim().is_empty() {
                 return;
             }
+            if tab_s.sess.borrow().stdin.is_none() {
+                push_msg(&tab_s, "System", "No running session. Choose a folder first.");
+                return;
+            }
             tab_s.entry.set_text("");
-            append(&tab_s.buffer, "You", &msg);
-            start_turn(&tab_s, msg, false);
+            push_msg(&tab_s, "You", &msg);
+            send_turn(&tab_s, &msg);
         });
     }
     {
@@ -415,7 +535,6 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> (gtk::Widge
         entry.connect_activate(move |_| send.emit_clicked());
     }
 
-    // Approve
     {
         let tab_a = tab.clone();
         approve.connect_clicked(move |_| {
@@ -437,20 +556,27 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> (gtk::Widge
             if !ok {
                 return;
             }
-            append(&tab_a.buffer, "You", "[Approved — granting access and continuing]");
-            start_turn(
-                &tab_a,
-                "Approved. Proceed with the action you described.".to_string(),
-                true,
-            );
+            push_msg(&tab_a, "You", "[Approved — restarting session with access, continuing]");
+            spawn_proc(&tab_a, true);
+            send_turn(&tab_a, "Approved. Proceed with the action you described.");
         });
     }
 
-    (root.upcast(), "session".to_string())
+    {
+        let tab_m = tab.clone();
+        mode.connect_selected_notify(move |_| {
+            if tab_m.sess.borrow().workdir.is_some() {
+                push_msg(&tab_m, "System", "Mode changed — restarting session (context kept).");
+                spawn_proc(&tab_m, false);
+            }
+        });
+    }
+
+    root.upcast()
 }
 
 fn add_tab(notebook: &gtk::Notebook, window: &ApplicationWindow, bin: Rc<String>) {
-    let (page, _) = build_session_tab(window, bin);
+    let page = build_session_tab(window, bin);
     let n = notebook.n_pages() + 1;
     let label = gtk::Label::new(Some(&format!("Session {n}")));
     let idx = notebook.append_page(&page, Some(&label));
@@ -463,7 +589,6 @@ fn build_ui(app: &Application) {
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     toolbar.set_margin_top(6);
-    toolbar.set_margin_bottom(0);
     toolbar.set_margin_start(6);
     let new_btn = gtk::Button::with_label("➕ New session");
     toolbar.append(&new_btn);
@@ -477,7 +602,7 @@ fn build_ui(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Claude Code — Linux GUI (v0.2.0)")
+        .title("Claude Code — Linux GUI (v0.5.0)")
         .default_width(1100)
         .default_height(780)
         .child(&vbox)
@@ -487,12 +612,10 @@ fn build_ui(app: &Application) {
         let notebook = notebook.clone();
         let window = window.clone();
         let bin = bin.clone();
-        new_btn.connect_clicked(move |_| {
-            add_tab(&notebook, &window, bin.clone());
-        });
+        new_btn.connect_clicked(move |_| add_tab(&notebook, &window, bin.clone()));
     }
 
-    add_tab(&notebook, &window, bin.clone()); // first session
+    add_tab(&notebook, &window, bin.clone());
     window.present();
 }
 
