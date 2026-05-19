@@ -42,6 +42,20 @@ install -m 0755 "$RELEASE_BIN" "$BIN_DST/$BIN"
 cp "$ICON_SRC" "$ICON_DST/"
 cp "$DESK_SRC" "$DESK_DST/"
 
+# Kill any running instance so the next launch is the binary just installed.
+# This is a single-instance GApplication: relaunching while an old copy is
+# alive silently re-activates the OLD process (you'd test stale code). Match
+# by real executable path via /proc, never by command-line pattern (pkill -f
+# would also match this script's own path).
+KILLED=0
+for pid in $(pgrep -x "$BIN" 2>/dev/null) $(pgrep -f "$BIN" 2>/dev/null); do
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || continue
+  case "$exe" in
+    */"$BIN") kill "$pid" 2>/dev/null && KILLED=$((KILLED+1)) ;;
+  esac
+done
+[ "$KILLED" -gt 0 ] && echo "Stopped $KILLED running instance(s) so the new build takes effect."
+
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$DESK_DST" 2>/dev/null || true
 fi

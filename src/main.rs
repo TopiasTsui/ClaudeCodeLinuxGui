@@ -2313,6 +2313,21 @@ fn open_settings_window(parent: &ApplicationWindow) {
     win.present();
 }
 
+// The installed binary's own mtime, shown in the title so it is always
+// obvious whether a fresh build is running (single-instance GApplication
+// means relaunching while an old copy is alive silently shows old code).
+fn build_stamp() -> String {
+    let secs = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let s = secs % 86400;
+    format!("{:02}:{:02}:{:02}Z", s / 3600, (s % 3600) / 60, s % 60)
+}
+
 fn build_ui(app: &Application) {
     let bin = Rc::new(resolve_claude());
 
@@ -2355,7 +2370,10 @@ fn build_ui(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Claude Code — Linux GUI (v0.5.2)")
+        .title(format!(
+            "Claude Code — Linux GUI (v0.5.2 · build {})",
+            build_stamp()
+        ))
         .default_width(1100)
         .default_height(780)
         .child(&vbox)
