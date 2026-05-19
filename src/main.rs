@@ -71,6 +71,7 @@ enum Route {
 enum Local {
     Status,
     Help,
+    Exit,
 }
 
 struct Cmd {
@@ -130,6 +131,12 @@ const COMMANDS: &[Cmd] = &[
         usage: "/help",
         help: "list these commands",
     },
+    Cmd {
+        name: "/exit",
+        route: Route::Local(Local::Exit),
+        usage: "/exit",
+        help: "close this session tab (kills its claude process)",
+    },
 ];
 
 fn lookup_cmd(name: &str) -> Option<&'static Cmd> {
@@ -166,6 +173,11 @@ fn resolve_claude() -> String {
 
 struct TurnResult {
     result: String,
+    /// The CLI marks the turn as errored when it ended without a real answer
+    /// — e.g. it called `AskUserQuestion` (interactive, unanswerable in the
+    /// stream-json transport) or was interrupted. In that case `result` holds
+    /// an error blurb, not the assistant text the user watched stream in.
+    is_error: bool,
     session_id: Option<String>,
     usage: Usage,
     denials: Vec<String>,
@@ -318,6 +330,10 @@ struct Tab {
     approve: gtk::Button,
     mode: gtk::DropDown,
     status: gtk::Label,
+    // Closes this session's tab (kills the CLI process, removes the notebook
+    // page). Set by `add_tab` once the notebook/page are known; invoked by the
+    // tab's ✕ button and by the `/exit` command.
+    close: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 }
 
 fn push_msg(tab: &Tab, who: &str, text: &str) {
@@ -364,6 +380,7 @@ fn parse_result(v: &serde_json::Value) -> TurnResult {
         .and_then(|x| x.as_str())
         .unwrap_or("(empty response)")
         .to_string();
+    let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
     let session_id = v.get("session_id").and_then(|x| x.as_str()).map(str::to_string);
     let u = v.get("usage");
     let tok = |k: &str| {
@@ -404,7 +421,7 @@ fn parse_result(v: &serde_json::Value) -> TurnResult {
             }
         }
     }
-    TurnResult { result, session_id, usage, denials, denied_dirs }
+    TurnResult { result, is_error, session_id, usage, denials, denied_dirs }
 }
 
 fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
@@ -661,7 +678,18 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                     tab.status.set_text("💭 thinking…");
                 }
                 Ev::Turn(o) => {
-                    tab.stream.borrow_mut().clear();
+                    // Capture the streamed text before dropping the live
+                    // buffer. When a turn ends because Claude needs permission,
+                    // the `result` event carries no assistant text (parsed as
+                    // "(empty response)"), so finalizing with `o.result` alone
+                    // would erase the answer the user just watched stream in,
+                    // right as the approval prompt appears.
+                    let streamed = {
+                        let mut live = tab.stream.borrow_mut();
+                        let s = live.clone();
+                        live.clear();
+                        s
+                    };
                     {
                         let mut s = tab.sess.borrow_mut();
                         if let Some(sid) = o.session_id {
@@ -675,7 +703,21 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                             s.good_overrides = s.overrides.clone();
                         }
                     }
-                    push_msg(&tab, "Claude", &o.result);
+                    // The turn's `result` is the canonical final text in the
+                    // normal case. But when it carries no real answer — empty,
+                    // the "(empty response)" placeholder, or an error blurb
+                    // (is_error: AskUserQuestion / interruption) — fall back to
+                    // the text we already streamed so it is NOT erased behind
+                    // the question/selection prompt.
+                    let result_unusable = o.is_error
+                        || o.result == "(empty response)"
+                        || o.result.trim().is_empty();
+                    let final_text = if result_unusable && !streamed.trim().is_empty() {
+                        streamed
+                    } else {
+                        o.result.clone()
+                    };
+                    push_msg(&tab, "Claude", &final_text);
                     if !o.denials.is_empty() {
                         {
                             let mut s = tab.sess.borrow_mut();
@@ -848,6 +890,15 @@ fn handle_command(tab: &Tab, line: &str) -> bool {
             let t = status_text(tab);
             push_msg(tab, "System", &t);
         }
+        Route::Local(Local::Exit) => {
+            // Clone the closure out before calling so the RefCell borrow is
+            // released first (the closure mutates session state).
+            let f = tab.close.borrow().clone();
+            match f {
+                Some(f) => f(),
+                None => push_msg(tab, "System", "Cannot close this session."),
+            }
+        }
         Route::RespawnBool(flag) => {
             let flag: &str = flag;
             if tab.sess.borrow().workdir.is_none() {
@@ -946,7 +997,7 @@ fn build_session_tab(
     window: &ApplicationWindow,
     bin: Rc<String>,
     resume: Option<(PathBuf, String)>,
-) -> gtk::Widget {
+) -> (gtk::Widget, Tab) {
     let sess = Rc::new(RefCell::new(Session::default()));
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -1054,6 +1105,7 @@ fn build_session_tab(
         approve: approve.clone(),
         mode: mode.clone(),
         status: status.clone(),
+        close: Rc::new(RefCell::new(None)),
     };
     render(&tab);
 
@@ -1420,7 +1472,7 @@ fn build_session_tab(
         spawn_proc(&tab, false);
     }
 
-    root.upcast()
+    (root.upcast(), tab)
 }
 
 fn add_tab(
@@ -1429,11 +1481,59 @@ fn add_tab(
     bin: Rc<String>,
     resume: Option<(PathBuf, String)>,
 ) {
-    let page = build_session_tab(window, bin, resume);
+    let (page, tab) = build_session_tab(window, bin, resume);
     let n = notebook.n_pages() + 1;
+
+    // Tab label is a box: title + a flat ✕ button.
+    let label_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     let label = gtk::Label::new(Some(&format!("Session {n}")));
-    let idx = notebook.append_page(&page, Some(&label));
+    let close_btn = gtk::Button::from_icon_name("window-close-symbolic");
+    close_btn.add_css_class("flat");
+    close_btn.set_has_frame(false);
+    close_btn.set_tooltip_text(Some("Close this session (kills its claude process)"));
+    label_box.append(&label);
+    label_box.append(&close_btn);
+
+    let idx = notebook.append_page(&page, Some(&label_box));
     notebook.set_current_page(Some(idx));
+
+    // Close = stop the receiver loop, kill the CLI process, drop the page.
+    // Captures session/gen (not the whole Tab) so the stored closure does not
+    // form a reference cycle through `tab.close`.
+    let close_fn: Rc<dyn Fn()> = {
+        let notebook = notebook.clone();
+        let page = page.clone();
+        let sess = tab.sess.clone();
+        let gen = tab.gen.clone();
+        Rc::new(move || {
+            gen.set(gen.get().wrapping_add(1));
+            if let Some(mut c) = sess.borrow_mut().child.take() {
+                let _ = c.kill();
+            }
+            if let Some(p) = notebook.page_num(&page) {
+                notebook.remove_page(Some(p));
+            }
+        })
+    };
+    *tab.close.borrow_mut() = Some(close_fn.clone());
+    close_btn.connect_clicked(move |_| close_fn());
+
+    // Switching to this session puts the cursor straight in its input box.
+    // Each tab registers its own handler and acts only when it is the page
+    // being switched to. Focus is deferred to an idle tick so it lands after
+    // the notebook has finished mapping the page.
+    notebook.connect_switch_page({
+        let page = page.clone();
+        let entry = tab.entry.clone();
+        move |_nb, switched, _| {
+            if switched == &page {
+                let entry = entry.clone();
+                glib::idle_add_local_once(move || {
+                    entry.grab_focus();
+                });
+            }
+        }
+    });
 }
 
 // ── Read-only management panel (see DESIGN.md) ───────────────────────────
