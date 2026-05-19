@@ -189,3 +189,65 @@ Cross-cutting:
 - Still no curated catalog/ratings — marketplaces and the CLI are the
   only source of truth.
 - v2 builds on a runtime-verified v1.
+
+---
+
+# Feature batch 1: interrupt / @file / command autocomplete / session resume
+
+Same thin-transport rule: nothing mirrors client-internal state; anything
+the stream-json protocol does not expose is probe-gated with a reliable
+fallback or simply not done. Each item below records the decision and the
+points to verify when implementing (the on-disk session format and the
+control-protocol availability are not assumed).
+
+## 1. Stop / interrupt the current turn
+
+While a turn is in flight, show a Stop control. Mechanism (same A/B split
+as the command layer):
+
+- **A (implemented):** kill the child and respawn with `--resume <sid>`
+  (existing spawn_proc path; context carries). A turn killed mid-flight may
+  not persist; resume continues from the last persisted state. Acceptable
+  for "stop".
+- **B (NOT implemented — deferred):** a stream-json control request to
+  interrupt without killing the process. Shipping this would mean guessing
+  an unprobed protocol shape, which violates "never assumed". Left out
+  until a runtime probe exists; A is correct and sufficient.
+
+UI: a dedicated **Stop** button, live only while a turn is in flight (the
+inverse of the send controls, via `ui_idle/ui_busy/ui_dead`). On stop,
+re-enable input. No new state model — reuses gen/respawn.
+
+## 2. @file insert (path picker)
+
+A button opens the existing FileDialog; the chosen path is inserted into
+the entry (absolute, or workdir-relative when inside the workdir). It is a
+**path inserter, not the interactive client's @-mention engine** — in
+`-p` stream-json mode `@path` is literal text, not expanded. Reads remain
+subject to the existing permission model (inside workdir = free; outside =
+Approve flow). No protocol change.
+
+## 3. `/` command autocomplete
+
+Sourced **only from the COMMANDS registry** (consistent with "adding a
+command is one row"). When the entry text starts with `/`, a popover
+lists matching name + usage; pick completes the entry. Unknown `/x` still
+passes through (Route D) unchanged. GTK4 EntryCompletion is deprecated, so
+a custom Popover + list is used. Project `.claude/commands/*` are NOT
+enumerated in this batch (possible later extension; would need workdir scan).
+
+## 4. Session history / resume
+
+List prior sessions and resume one into a new tab. Sessions are read from
+`~/.claude/projects/<project>/*.jsonl` (Claude Code's per-project session
+store). **The exact on-disk shape is verified at implement time, not
+assumed**; parsing is defensive (session id from filename, first user
+message as a label, mtime for ordering; if the format differs, degrade to
+listing the files). Resume = the existing spawn_proc path with that
+workdir + session_id + `--resume`; the CLI's own picker logic is not
+reimplemented. Read-only listing; async fetch + list reuse the management
+panel pattern.
+
+Cross-cutting: control-protocol interrupt and the session-file format are
+the two runtime-unknowns; both degrade safely (respawn / file list) if the
+probe fails.

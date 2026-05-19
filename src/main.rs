@@ -287,7 +287,9 @@ struct Tab {
     web: webkit6::WebView,
     entry: gtk::Entry,
     img: gtk::Button,
+    file: gtk::Button,
     send: gtk::Button,
+    stop: gtk::Button,
     approve: gtk::Button,
     mode: gtk::DropDown,
     status: gtk::Label,
@@ -296,6 +298,30 @@ struct Tab {
 fn push_msg(tab: &Tab, who: &str, text: &str) {
     tab.msgs.borrow_mut().push((who.to_string(), text.to_string()));
     render(tab);
+}
+
+// Three input states. `stop` is the inverse of the send controls: live only
+// while a turn is in flight.
+fn ui_idle(tab: &Tab) {
+    tab.entry.set_sensitive(true);
+    tab.img.set_sensitive(true);
+    tab.file.set_sensitive(true);
+    tab.send.set_sensitive(true);
+    tab.stop.set_sensitive(false);
+}
+fn ui_busy(tab: &Tab) {
+    tab.entry.set_sensitive(false);
+    tab.img.set_sensitive(false);
+    tab.file.set_sensitive(false);
+    tab.send.set_sensitive(false);
+    tab.stop.set_sensitive(true);
+}
+fn ui_dead(tab: &Tab) {
+    tab.entry.set_sensitive(false);
+    tab.img.set_sensitive(false);
+    tab.file.set_sensitive(false);
+    tab.send.set_sensitive(false);
+    tab.stop.set_sensitive(false);
 }
 
 fn parse_result(v: &serde_json::Value) -> TurnResult {
@@ -632,9 +658,7 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                         tab.sess.borrow_mut().pending_approval = false;
                     }
                     tab.status.set_text("");
-                    tab.entry.set_sensitive(true);
-                    tab.img.set_sensitive(true);
-                    tab.send.set_sensitive(true);
+                    ui_idle(&tab);
                 }
                 Ev::Ended(why) => {
                     tab.stream.borrow_mut().clear();
@@ -683,9 +707,7 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                     };
                     push_msg(&tab, "System", &msg);
                     tab.status.set_text("");
-                    tab.entry.set_sensitive(false);
-                    tab.img.set_sensitive(false);
-                    tab.send.set_sensitive(false);
+                    ui_dead(&tab);
                     break;
                 }
             }
@@ -708,9 +730,7 @@ fn send_turn(tab: &Tab, message: &str) {
     drop(s);
     if ok {
         tab.status.set_text("⏳ working…");
-        tab.entry.set_sensitive(false);
-        tab.img.set_sensitive(false);
-        tab.send.set_sensitive(false);
+        ui_busy(tab);
         tab.approve.set_sensitive(false);
     } else {
         push_msg(tab, "System", "Error: session process not running. Re-choose the folder.");
@@ -856,7 +876,11 @@ fn handle_command(tab: &Tab, line: &str) -> bool {
     true
 }
 
-fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget {
+fn build_session_tab(
+    window: &ApplicationWindow,
+    bin: Rc<String>,
+    resume: Option<(PathBuf, String)>,
+) -> gtk::Widget {
     let sess = Rc::new(RefCell::new(Session::default()));
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -890,13 +914,23 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
     let img = gtk::Button::with_label("📎 Image");
     img.set_tooltip_text(Some("Paste an image from the clipboard and send it"));
     img.set_sensitive(false);
+    let file = gtk::Button::with_label("📄 File");
+    file.set_tooltip_text(Some("Insert a file path into the message"));
+    file.set_sensitive(false);
     let approve = gtk::Button::with_label("Approve");
     approve.set_sensitive(false);
+    let stop = gtk::Button::with_label("■ Stop");
+    stop.set_tooltip_text(Some(
+        "Interrupt the current turn (restarts the session with --resume; context kept)",
+    ));
+    stop.set_sensitive(false);
     let send = gtk::Button::with_label("Send");
     send.set_sensitive(false);
     bottom.append(&entry);
     bottom.append(&img);
+    bottom.append(&file);
     bottom.append(&approve);
+    bottom.append(&stop);
     bottom.append(&send);
 
     root.append(&top);
@@ -913,7 +947,9 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
         web: web.clone(),
         entry: entry.clone(),
         img: img.clone(),
+        file: file.clone(),
         send: send.clone(),
+        stop: stop.clone(),
         approve: approve.clone(),
         mode: mode.clone(),
         status: status.clone(),
@@ -946,9 +982,7 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
                         tab_fp.msgs.borrow_mut().clear();
                         tab_fp.stream.borrow_mut().clear();
                         dir_label.set_text(&path.to_string_lossy());
-                        tab_fp.entry.set_sensitive(true);
-                        tab_fp.img.set_sensitive(true);
-                        tab_fp.send.set_sensitive(true);
+                        ui_idle(&tab_fp);
                         tab_fp.approve.set_sensitive(false);
                         push_msg(
                             &tab_fp,
@@ -1087,11 +1121,170 @@ fn build_session_tab(window: &ApplicationWindow, bin: Rc<String>) -> gtk::Widget
         });
     }
 
+    // ② @file: pick a file, insert its path (workdir-relative when inside the
+    // workdir) into the entry. NOT the client's @-mention engine — `-p` mode
+    // treats it as literal text; reads stay under the existing permissions.
+    {
+        let tab_f = tab.clone();
+        let window = window.clone();
+        file.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::builder().title("Insert file path").build();
+            let tab_f = tab_f.clone();
+            dialog.open(Some(&window), gtk::gio::Cancellable::NONE, move |res| {
+                if let Ok(f) = res {
+                    if let Some(p) = f.path() {
+                        let txt = {
+                            let s = tab_f.sess.borrow();
+                            match &s.workdir {
+                                Some(wd) => p
+                                    .strip_prefix(wd)
+                                    .map(|r| r.to_string_lossy().to_string())
+                                    .unwrap_or_else(|_| p.to_string_lossy().to_string()),
+                                None => p.to_string_lossy().to_string(),
+                            }
+                        };
+                        let e = &tab_f.entry;
+                        let mut pos = e.position();
+                        let ins = if e.text().is_empty() {
+                            txt
+                        } else {
+                            format!(" {txt} ")
+                        };
+                        e.insert_text(&ins, &mut pos);
+                        e.set_position(pos);
+                        e.grab_focus();
+                    }
+                }
+            });
+        });
+    }
+
+    // ① Stop: reliable path only — kill + respawn with `--resume` (session_id
+    // kept). Control-protocol interrupt is intentionally NOT done here: it
+    // would need a runtime probe we cannot do, and the DESIGN's A fallback is
+    // correct and sufficient. A turn killed mid-flight may not persist.
+    {
+        let tab_st = tab.clone();
+        stop.connect_clicked(move |_| {
+            if tab_st.sess.borrow().child.is_none() {
+                return;
+            }
+            spawn_proc(&tab_st, false);
+            tab_st.stream.borrow_mut().clear();
+            tab_st.status.set_text("");
+            push_msg(
+                &tab_st,
+                "System",
+                "■ Stopped — session restarted (context kept).",
+            );
+            ui_idle(&tab_st);
+            tab_st.approve.set_sensitive(false);
+        });
+    }
+
+    // ③ `/` autocomplete from the COMMANDS registry only. autohide=false so
+    // the popover never steals focus from the entry while typing.
+    {
+        let pop = gtk::Popover::new();
+        pop.set_parent(&entry);
+        pop.set_autohide(false);
+        pop.set_has_arrow(false);
+        pop.set_position(gtk::PositionType::Top);
+        let list = gtk::ListBox::new();
+        list.set_activate_on_single_click(true);
+        let sc = gtk::ScrolledWindow::new();
+        sc.set_min_content_width(380);
+        sc.set_max_content_height(180);
+        sc.set_propagate_natural_height(true);
+        sc.set_child(Some(&list));
+        pop.set_child(Some(&sc));
+        let names: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            let pop = pop.clone();
+            let list = list.clone();
+            let names = names.clone();
+            entry.connect_changed(move |e| {
+                let t = e.text();
+                let t = t.as_str();
+                let tok = t.split_whitespace().next().unwrap_or("");
+                if !t.starts_with('/') || tok.is_empty() {
+                    pop.popdown();
+                    return;
+                }
+                while let Some(c) = list.first_child() {
+                    list.remove(&c);
+                }
+                names.borrow_mut().clear();
+                let mut any = false;
+                for c in COMMANDS {
+                    if c.name.starts_with(tok) && c.name != tok {
+                        let lbl = gtk::Label::new(Some(&format!(
+                            "{}   —   {}",
+                            c.name, c.usage
+                        )));
+                        lbl.set_xalign(0.0);
+                        list.append(&lbl);
+                        names.borrow_mut().push(c.name);
+                        any = true;
+                    }
+                }
+                if any {
+                    pop.popup();
+                } else {
+                    pop.popdown();
+                }
+            });
+        }
+        {
+            let entry = entry.clone();
+            let pop = pop.clone();
+            list.connect_row_activated(move |_, row| {
+                let i = row.index();
+                if i < 0 {
+                    return;
+                }
+                if let Some(name) = names.borrow().get(i as usize).copied() {
+                    entry.set_text(&format!("{name} "));
+                    entry.set_position(-1);
+                    pop.popdown();
+                    entry.grab_focus();
+                }
+            });
+        }
+    }
+
+    // ④ Resume bootstrap: pre-load workdir + session id and start with
+    // `--resume` (the existing spawn path).
+    if let Some((wd, sid)) = resume {
+        {
+            let mut s = tab.sess.borrow_mut();
+            *s = Session {
+                workdir: Some(wd.clone()),
+                session_id: Some(sid.clone()),
+                ..Session::default()
+            };
+        }
+        dir_label.set_text(&wd.to_string_lossy());
+        ui_idle(&tab);
+        tab.approve.set_sensitive(false);
+        push_msg(
+            &tab,
+            "System",
+            &format!("Resuming session {sid}\n{}", wd.to_string_lossy()),
+        );
+        spawn_proc(&tab, false);
+    }
+
     root.upcast()
 }
 
-fn add_tab(notebook: &gtk::Notebook, window: &ApplicationWindow, bin: Rc<String>) {
-    let page = build_session_tab(window, bin);
+fn add_tab(
+    notebook: &gtk::Notebook,
+    window: &ApplicationWindow,
+    bin: Rc<String>,
+    resume: Option<(PathBuf, String)>,
+) {
+    let page = build_session_tab(window, bin, resume);
     let n = notebook.n_pages() + 1;
     let label = gtk::Label::new(Some(&format!("Session {n}")));
     let idx = notebook.append_page(&page, Some(&label));
@@ -1724,6 +1917,181 @@ fn open_manage_window(parent: &ApplicationWindow, bin: Rc<String>) {
     win.present();
 }
 
+// ④ Scan ~/.claude/projects/<proj>/*.jsonl for resumable sessions. The
+// on-disk shape is parsed defensively: session id = file stem, cwd from any
+// line carrying a "cwd" string, label = first user message. Files without a
+// cwd are skipped (cannot resume without one). Returns newest first.
+fn scan_sessions() -> Vec<(std::time::SystemTime, String, PathBuf, String)> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let root = PathBuf::from(format!("{home}/.claude/projects"));
+    let mut out: Vec<(std::time::SystemTime, String, PathBuf, String)> = Vec::new();
+    let projs = match std::fs::read_dir(&root) {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    for proj in projs.flatten() {
+        let files = match std::fs::read_dir(proj.path()) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for f in files.flatten() {
+            let path = f.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let sid = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            let file = match std::fs::File::open(&path) {
+                Ok(fl) => fl,
+                Err(_) => continue,
+            };
+            let mut cwd: Option<String> = None;
+            let mut label: Option<String> = None;
+            for line in BufReader::new(file).lines().map_while(Result::ok).take(80) {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if cwd.is_none() {
+                    if let Some(c) = v.get("cwd").and_then(|x| x.as_str()) {
+                        cwd = Some(c.to_string());
+                    }
+                }
+                if label.is_none() {
+                    let is_user = v.get("type").and_then(|t| t.as_str()) == Some("user")
+                        || v.get("message")
+                            .and_then(|m| m.get("role"))
+                            .and_then(|r| r.as_str())
+                            == Some("user");
+                    if is_user {
+                        let content = v
+                            .get("message")
+                            .and_then(|m| m.get("content"));
+                        let txt = content
+                            .and_then(|c| c.as_str().map(String::from))
+                            .or_else(|| {
+                                content
+                                    .and_then(|c| c.as_array())
+                                    .and_then(|a| a.first())
+                                    .and_then(|b| b.get("text"))
+                                    .and_then(|t| t.as_str())
+                                    .map(String::from)
+                            });
+                        if let Some(t) = txt {
+                            let t = t.trim().replace('\n', " ");
+                            if !t.is_empty() {
+                                label = Some(t.chars().take(80).collect());
+                            }
+                        }
+                    }
+                }
+                if cwd.is_some() && label.is_some() {
+                    break;
+                }
+            }
+            if let Some(c) = cwd {
+                out.push((
+                    mtime,
+                    sid,
+                    PathBuf::from(c),
+                    label.unwrap_or_else(|| "(no preview)".into()),
+                ));
+            }
+        }
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.truncate(200);
+    out
+}
+
+fn open_resume_window(
+    notebook: &gtk::Notebook,
+    parent: &ApplicationWindow,
+    bin: Rc<String>,
+) {
+    let win = gtk::Window::builder()
+        .title("Resume a session")
+        .transient_for(parent)
+        .default_width(760)
+        .default_height(560)
+        .build();
+    let v = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    v.set_margin_top(6);
+    v.set_margin_bottom(6);
+    v.set_margin_start(6);
+    v.set_margin_end(6);
+    let status = gtk::Label::new(Some("scanning ~/.claude/projects…"));
+    status.set_xalign(0.0);
+    let list = gtk::ListBox::new();
+    list.set_activate_on_single_click(false); // double-click / Enter to resume
+    let sc = gtk::ScrolledWindow::new();
+    sc.set_vexpand(true);
+    sc.set_child(Some(&list));
+    v.append(&status);
+    v.append(&sc);
+    win.set_child(Some(&v));
+
+    let picks: Rc<RefCell<Vec<(PathBuf, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let (tx, rx) =
+            async_channel::bounded::<Vec<(std::time::SystemTime, String, PathBuf, String)>>(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(scan_sessions());
+        });
+        let list = list.clone();
+        let status = status.clone();
+        let picks = picks.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(rows) = rx.recv().await {
+                if rows.is_empty() {
+                    status.set_text("No resumable sessions found in ~/.claude/projects.");
+                    return;
+                }
+                status.set_text(&format!("{} session(s) — double-click to resume", rows.len()));
+                for (_, sid, cwd, label) in rows {
+                    let short = sid.chars().take(8).collect::<String>();
+                    let lbl = gtk::Label::new(Some(&format!(
+                        "{}\n{}   ·   {}",
+                        label,
+                        cwd.to_string_lossy(),
+                        short
+                    )));
+                    lbl.set_xalign(0.0);
+                    list.append(&lbl);
+                    picks.borrow_mut().push((cwd, sid));
+                }
+            }
+        });
+    }
+    {
+        let notebook = notebook.clone();
+        let parent = parent.clone();
+        let bin = bin.clone();
+        let picks = picks.clone();
+        let win = win.clone();
+        list.connect_row_activated(move |_, row| {
+            let i = row.index();
+            if i < 0 {
+                return;
+            }
+            if let Some((cwd, sid)) = picks.borrow().get(i as usize).cloned() {
+                add_tab(&notebook, &parent, bin.clone(), Some((cwd, sid)));
+                win.close();
+            }
+        });
+    }
+    win.present();
+}
+
 fn build_ui(app: &Application) {
     let bin = Rc::new(resolve_claude());
 
@@ -1738,6 +2106,11 @@ fn build_ui(app: &Application) {
         "Browse installed/available plugins, MCP servers, skills (read-only)",
     ));
     toolbar.append(&manage_btn);
+    let resume_btn = gtk::Button::with_label("⟲ Resume…");
+    resume_btn.set_tooltip_text(Some(
+        "Resume a previous session from ~/.claude/projects",
+    ));
+    toolbar.append(&resume_btn);
 
     let notebook = gtk::Notebook::new();
     notebook.set_vexpand(true);
@@ -1767,15 +2140,23 @@ fn build_ui(app: &Application) {
         let notebook = notebook.clone();
         let window = window.clone();
         let bin = bin.clone();
-        new_btn.connect_clicked(move |_| add_tab(&notebook, &window, bin.clone()));
+        new_btn.connect_clicked(move |_| add_tab(&notebook, &window, bin.clone(), None));
     }
     {
         let window = window.clone();
         let bin = bin.clone();
         manage_btn.connect_clicked(move |_| open_manage_window(&window, bin.clone()));
     }
+    {
+        let notebook = notebook.clone();
+        let window = window.clone();
+        let bin = bin.clone();
+        resume_btn.connect_clicked(move |_| {
+            open_resume_window(&notebook, &window, bin.clone())
+        });
+    }
 
-    add_tab(&notebook, &window, bin.clone());
+    add_tab(&notebook, &window, bin.clone(), None);
     window.present();
 }
 
