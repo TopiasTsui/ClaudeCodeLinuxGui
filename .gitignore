@@ -5,3 +5,6 @@ Cargo.lock
 # Scratch images written by the "📎 Image" clipboard-paste feature into the
 # session workdir (this repo can itself be a workdir).
 .ccgui-paste-*.png
+
+# .deb build output (pkg/build-deb.sh)
+/dist

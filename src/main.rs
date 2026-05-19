@@ -1020,6 +1020,11 @@ fn build_session_tab(
 
     let web = webkit6::WebView::new();
     web.set_vexpand(true);
+    // The transcript is read-only output. Keep it out of the focus chain so
+    // WebKit does not grab focus when the page is (re)mapped on a tab switch
+    // — that was overriding the focus we move to the input box below — and so
+    // Tab navigation never gets stuck in the rendered HTML.
+    web.set_can_focus(false);
 
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     // Multi-line input: TextView in a height-bounded ScrolledWindow, with a
@@ -1055,13 +1060,31 @@ fn build_session_tab(
     entry_overlay.set_child(Some(&entry_scroll));
     entry_overlay.add_overlay(&placeholder);
     {
-        // Show the placeholder only while the buffer is empty. Toggle once
-        // now for the initial state, then on every buffer change.
-        let placeholder = placeholder.clone();
-        let buf = entry.buffer();
-        let sync = move |b: &gtk::TextBuffer| placeholder.set_visible(b.char_count() == 0);
-        sync(&buf);
-        buf.connect_changed(move |b| sync(b));
+        // Placeholder shows only when the input is BOTH empty AND unfocused.
+        // Also hiding it on focus gives a clear "ready to type" cue — needed
+        // because switching sessions auto-focuses an empty input and the bare
+        // caret is easy to miss behind the placeholder text. Re-synced on
+        // buffer changes and on focus enter/leave.
+        let sync: Rc<dyn Fn()> = Rc::new({
+            let placeholder = placeholder.clone();
+            let entry = entry.clone();
+            move || {
+                let empty = entry.buffer().char_count() == 0;
+                placeholder.set_visible(empty && !entry.has_focus());
+            }
+        });
+        sync();
+        entry.buffer().connect_changed({
+            let sync = sync.clone();
+            move |_| sync()
+        });
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_enter({
+            let sync = sync.clone();
+            move |_| sync()
+        });
+        focus.connect_leave(move |_| sync());
+        entry.add_controller(focus);
     }
     let img = gtk::Button::with_label("📎 Image");
     img.set_tooltip_text(Some("Paste an image from the clipboard and send it"));
@@ -1519,16 +1542,23 @@ fn add_tab(
     close_btn.connect_clicked(move |_| close_fn());
 
     // Switching to this session puts the cursor straight in its input box.
-    // Each tab registers its own handler and acts only when it is the page
-    // being switched to. Focus is deferred to an idle tick so it lands after
-    // the notebook has finished mapping the page.
+    // Each tab registers its own handler and acts only when its page is the
+    // one switched to — matched by page index (the `num` arg vs this page's
+    // current position), not widget identity.
+    //
+    // The grab is deferred with a short timeout, not an idle tick: a mouse
+    // click on a tab emits switch-page first (idle would run here) but the
+    // notebook then re-grabs focus to the clicked tab label on button-release,
+    // which is processed *after* the idle — so an idle grab gets stolen back.
+    // A small timeout lands after the click fully settles. (Focusing also
+    // hides the input's placeholder, so the switch is visibly "ready".)
     notebook.connect_switch_page({
         let page = page.clone();
         let entry = tab.entry.clone();
-        move |_nb, switched, _| {
-            if switched == &page {
+        move |nb, _switched, num| {
+            if nb.page_num(&page) == Some(num) {
                 let entry = entry.clone();
-                glib::idle_add_local_once(move || {
+                glib::timeout_add_local_once(Duration::from_millis(80), move || {
                     entry.grab_focus();
                 });
             }
