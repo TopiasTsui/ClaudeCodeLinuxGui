@@ -19,16 +19,31 @@ official **Claude Code** CLI on Linux.
 - **Multiple sessions** — tabs (`➕ New session`); each is an independent
   conversation (own folder, history, approved dirs).
 - **Streaming output** with Markdown rendering; live tool / thinking status.
+- **Multi-line input**: **Alt+Enter sends**; plain **Enter inserts a
+  newline** and (importantly) commits a CJK/IME composition without sending.
+  The **Send** button always sends.
 - **Per-session permission mode** dropdown (`Ask` / `Plan` / `Accept edits`
   / `Auto`) and an **Approve** flow for denied actions (restarts with
   `--resume` so context carries).
-- **Built-in commands** (a leading `/`; unknown `/x` is sent verbatim):
-  `/model`, `/permission-mode`, `/clear`, `/status`, `/help`. See `DESIGN.md`.
-- **📎 Image** — paste a clipboard image into the workdir and ask Claude to
-  read it.
+- **■ Stop** — interrupt the current turn (restarts with `--resume`,
+  context kept).
+- **Built-in commands** (a leading `/`; unknown `/x` is sent verbatim),
+  with `/`-prefix autocomplete from the registry:
+  `/model`, `/permission-mode`, `/effort`, `/worktree`, `/fork-session`,
+  `/clear`, `/status`, `/help`. See `DESIGN.md`.
+- **📎 Image** — paste a clipboard image; it is *attached* (saved to the
+  workdir) so you can keep typing, and rides with your next message.
+- **📄 File** — insert a file path (workdir-relative when inside) into the
+  message.
+- **⟲ Resume…** — browse and resume a prior session from
+  `~/.claude/projects`.
+- **⚙ Settings** — raw JSON editor for `~/.claude/settings.json`
+  (validates on save, backs up to `settings.json.bak`).
 - **🧩 Manage** — browse installed/available plugins, marketplaces, MCP
   servers (read from `~/.claude.json`, secrets hidden), skills; confirmed
   plugin/marketplace/mcp actions. Read-only and mutating paths per `DESIGN.md`.
+- The window title shows a **build timestamp** (`build HH:MM:SSZ`) so it is
+  obvious whether a fresh build is running.
 
 ## Prerequisites
 
@@ -76,14 +91,26 @@ deps: `libgtk-4-1`, `libwebkitgtk-6.0-4`. Remove with
 
 ### Note: single-instance app
 
-It is a single-instance GApplication. If an old copy is still running, a new
-launch just re-activates the old one (you won't see new code). Close the
-running instance first (`pkill -f claude-code-linux-gui`).
+It is a single-instance GApplication: relaunching while an old copy is alive
+just re-activates the old process, so you would see stale code. Two
+safeguards: `./install.sh` stops any running instance before installing, and
+the window title shows a `build HH:MM:SSZ` stamp — glance at it to confirm
+the fresh build is running.
 
 ## Development build
 
 ```bash
-cargo run    # close any installed/running instance first (single-instance)
+cargo run
+```
+
+Single-instance still applies: stop any installed/running copy first. Match
+by executable, not `pkill -f` (its pattern would also match your shell's
+path):
+
+```bash
+for p in $(pgrep -f claude-code-linux-gui); do
+  case "$(readlink -f /proc/$p/exe)" in */claude-code-linux-gui) kill "$p";; esac
+done
 ```
 
 ## License
