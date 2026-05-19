@@ -361,6 +361,46 @@ fn flush_stream(tab: &Tab) {
     }
 }
 
+// Transcript zoom. WebKit's zoom_level scales the whole rendered page
+// (body/who/tool sizes together), so font size is one knob, no CSS plumbing.
+// Persisted as a single float in a GUI-local config file (NOT Claude's
+// settings.json) so the choice survives restarts and applies to new tabs.
+const ZOOM_MIN: f64 = 0.5;
+const ZOOM_MAX: f64 = 3.0;
+
+fn zoom_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(format!("{home}/.config/claude-code-linux-gui/zoom"))
+}
+
+fn load_zoom() -> f64 {
+    std::fs::read_to_string(zoom_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|z| z.is_finite())
+        .map(|z| z.clamp(ZOOM_MIN, ZOOM_MAX))
+        .unwrap_or(1.0)
+}
+
+fn save_zoom(z: f64) {
+    let p = zoom_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, format!("{z}"));
+}
+
+// Apply a zoom delta (factor, or None to reset to 1.0) to the transcript and
+// persist it. Clamped so it can never shrink to nothing or blow up.
+fn bump_zoom(web: &webkit6::WebView, factor: Option<f64>) {
+    let z = match factor {
+        Some(f) => (web.zoom_level() * f).clamp(ZOOM_MIN, ZOOM_MAX),
+        None => 1.0,
+    };
+    web.set_zoom_level(z);
+    save_zoom(z);
+}
+
 // Three input states. `stop` is the inverse of the send controls: live only
 // while a turn is in flight.
 fn ui_idle(tab: &Tab) {
@@ -1052,6 +1092,9 @@ fn build_session_tab(
     // — that was overriding the focus we move to the input box below — and so
     // Tab navigation never gets stuck in the rendered HTML.
     web.set_can_focus(false);
+    // Restore the persisted transcript zoom so a new tab opens at the size
+    // the user last chose (Ctrl+= / Ctrl+- / Ctrl+0).
+    web.set_zoom_level(load_zoom());
 
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     // Multi-line input: TextView in a height-bounded ScrolledWindow, with a
@@ -1268,14 +1311,16 @@ fn build_session_tab(
         entry.add_controller(kc);
     }
     {
-        // Ctrl+C / Ctrl+A copy from the read-only transcript. The WebView is
-        // kept out of the focus chain (set_can_focus(false)) so keyboard
-        // events never reach it directly — focus sits on this input box even
-        // after the user mouse-selects text in the transcript. So intercept
-        // here and forward to WebKit's editing commands, which act on the DOM
-        // selection regardless of GTK focus. The input box keeps priority
-        // when it has its own work to do: a live selection (Ctrl+C) or any
-        // text to select (Ctrl+A) falls through to default TextView handling.
+        // Ctrl+C / Ctrl+A copy + Ctrl+= / Ctrl+- / Ctrl+0 zoom for the
+        // read-only transcript. The WebView is kept out of the focus chain
+        // (set_can_focus(false)) so keyboard events never reach it directly —
+        // focus sits on this input box even after the user mouse-selects text
+        // in the transcript. So intercept here and drive WebKit (editing
+        // commands act on the DOM selection, zoom_level scales the page),
+        // regardless of GTK focus. The input box keeps priority when it has
+        // its own work to do: a live selection (Ctrl+C) or any text to select
+        // (Ctrl+A) falls through to default TextView handling. Zoom keys are
+        // unused by the TextView, so they are always taken.
         let web = web.clone();
         let entry_c = entry.clone();
         let kc = gtk::EventControllerKey::new();
@@ -1294,6 +1339,23 @@ fn build_session_tab(
                 }
                 gtk::gdk::Key::a | gtk::gdk::Key::A if buf.char_count() == 0 => {
                     web.execute_editing_command("SelectAll");
+                    glib::Propagation::Stop
+                }
+                // Ctrl+= / Ctrl++ / Ctrl+KP_Add → larger
+                gtk::gdk::Key::equal
+                | gtk::gdk::Key::plus
+                | gtk::gdk::Key::KP_Add => {
+                    bump_zoom(&web, Some(1.1));
+                    glib::Propagation::Stop
+                }
+                // Ctrl+- / Ctrl+KP_Subtract → smaller
+                gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract => {
+                    bump_zoom(&web, Some(1.0 / 1.1));
+                    glib::Propagation::Stop
+                }
+                // Ctrl+0 / Ctrl+KP_0 → reset to default
+                gtk::gdk::Key::_0 | gtk::gdk::Key::KP_0 => {
+                    bump_zoom(&web, None);
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
