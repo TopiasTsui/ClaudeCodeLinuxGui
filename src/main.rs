@@ -1267,6 +1267,40 @@ fn build_session_tab(
         });
         entry.add_controller(kc);
     }
+    {
+        // Ctrl+C / Ctrl+A copy from the read-only transcript. The WebView is
+        // kept out of the focus chain (set_can_focus(false)) so keyboard
+        // events never reach it directly — focus sits on this input box even
+        // after the user mouse-selects text in the transcript. So intercept
+        // here and forward to WebKit's editing commands, which act on the DOM
+        // selection regardless of GTK focus. The input box keeps priority
+        // when it has its own work to do: a live selection (Ctrl+C) or any
+        // text to select (Ctrl+A) falls through to default TextView handling.
+        let web = web.clone();
+        let entry_c = entry.clone();
+        let kc = gtk::EventControllerKey::new();
+        kc.set_propagation_phase(gtk::PropagationPhase::Capture);
+        kc.connect_key_pressed(move |_, key, _, mods| {
+            if !mods.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            let buf = entry_c.buffer();
+            match key {
+                gtk::gdk::Key::c | gtk::gdk::Key::C
+                    if buf.selection_bounds().is_none() =>
+                {
+                    web.execute_editing_command("Copy");
+                    glib::Propagation::Stop
+                }
+                gtk::gdk::Key::a | gtk::gdk::Key::A if buf.char_count() == 0 => {
+                    web.execute_editing_command("SelectAll");
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        entry.add_controller(kc);
+    }
 
     {
         let tab_a = tab.clone();
