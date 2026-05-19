@@ -1,0 +1,22 @@
+#!/bin/sh
+# Loaded after files are unpacked. Best-effort and never fatal: a failure
+# here must not break package installation.
+set -e
+
+if [ "$1" = "configure" ]; then
+    PROFILE=/etc/apparmor.d/claude-code-linux-gui
+    # Ubuntu 23.10+ blocks unprivileged user namespaces; without this profile
+    # WebKitGTK's bwrap sandbox aborts the app. Load it if AppArmor is here.
+    if command -v apparmor_parser >/dev/null 2>&1 && [ -f "$PROFILE" ]; then
+        apparmor_parser -r -W "$PROFILE" 2>/dev/null || \
+            echo "claude-code-linux-gui: could not load AppArmor profile (non-fatal)"
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q /usr/share/applications 2>/dev/null || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -q -t /usr/share/icons/hicolor 2>/dev/null || true
+    fi
+fi
+
+exit 0

@@ -1,0 +1,13 @@
+#!/bin/sh
+# Unload the AppArmor profile only on real removal (not on upgrade), while
+# the profile file still exists. Never fatal.
+set -e
+
+if [ "$1" = "remove" ]; then
+    PROFILE=/etc/apparmor.d/claude-code-linux-gui
+    if command -v apparmor_parser >/dev/null 2>&1 && [ -f "$PROFILE" ]; then
+        apparmor_parser -R "$PROFILE" 2>/dev/null || true
+    fi
+fi
+
+exit 0

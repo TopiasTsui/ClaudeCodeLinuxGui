@@ -4,10 +4,6 @@ version = "0.5.2"
 edition = "2021"
 description = "A native (GTK4, no Electron) Linux GUI for the official Claude Code CLI: persistent per-session process, streaming output, multi-session, per-session permission mode, full tools, Markdown rendering. Not affiliated with Anthropic."
 
-# NOTE: versions below are best-effort and NOT verified by a compiler in the
-# environment where this was written (no Rust toolchain present there).
-# `cargo` will resolve; the compiler will surface any mismatch. Fix against
-# real `cargo build` output.
 [dependencies]
 gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
 serde_json = "1"
@@ -15,3 +11,27 @@ uuid = { version = "1", features = ["v4"] }
 async-channel = "2"
 webkit6 = "0.4"
 pulldown-cmark = "0.12"
+
+# `cargo deb` packaging. License is intentionally undecided (see README);
+# the generated copyright file states the default "all rights reserved".
+[package.metadata.deb]
+maintainer = "Topias <topiastsui@gmail.com>"
+copyright = "No license chosen yet; all rights reserved by the author. Not affiliated with Anthropic."
+license-file = ["LICENSE.deb.txt", "0"]
+extended-description = """\
+Native GTK4 (no Electron) desktop GUI wrapping the official Claude Code CLI: \
+persistent per-session process over stream-json, streaming Markdown output, \
+multi-session tabs, per-session permission mode, built-in command dispatcher, \
+clipboard image paste, and a read-only/confirmed plugin/MCP/skill manager. \
+Independent project, not affiliated with Anthropic."""
+section = "utils"
+priority = "optional"
+depends = "$auto, libgtk-4-1, libwebkitgtk-6.0-4"
+assets = [
+    ["target/release/claude-code-linux-gui", "usr/bin/", "755"],
+    ["assets/dev.local.claude_code_linux_gui.desktop", "usr/share/applications/", "644"],
+    ["assets/hicolor/scalable/apps/dev.local.claude_code_linux_gui.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["assets/apparmor/claude-code-linux-gui", "etc/apparmor.d/", "644"],
+    ["README.md", "usr/share/doc/claude-code-linux-gui/", "644"],
+]
+maintainer-scripts = "pkg/deb"

@@ -59,6 +59,21 @@ denied`). Install the bundled AppArmor profile once (it only re-grants
 sudo ./install-apparmor.sh
 ```
 
+### Build a .deb (distributable / other machines)
+
+```bash
+cargo install cargo-deb     # once
+cargo deb                   # -> target/debian/claude-code-linux-gui_<ver>_amd64.deb
+sudo apt install ./target/debian/claude-code-linux-gui_*.deb
+```
+
+Installs the binary to `/usr/bin`, the icon/`.desktop`, and the AppArmor
+profile to `/etc/apparmor.d` (a conffile). The package's `postinst` loads
+the AppArmor profile automatically, so the separate `install-apparmor.sh`
+step is **not** needed when installing via the `.deb`. Declared runtime
+deps: `libgtk-4-1`, `libwebkitgtk-6.0-4`. Remove with
+`sudo apt remove claude-code-linux-gui` (unloads the profile).
+
 ### Note: single-instance app
 
 It is a single-instance GApplication. If an old copy is still running, a new
