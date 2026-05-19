@@ -122,6 +122,8 @@ Polygon (PoS) network**:
 0x5072b3d05f1550f30bd22b0175ca55bb27294bca
 ```
 
+<img src="assets/donate-polygon.png" alt="Polygon donation address QR (0x5072b3d05f1550f30bd22b0175ca55bb27294bca)" width="200">
+
 [View on Polygonscan](https://polygonscan.com/address/0x5072b3d05f1550f30bd22b0175ca55bb27294bca)
 
 > ⚠️ **Polygon network only.** Send only USDT or USDC on Polygon PoS to
