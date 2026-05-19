@@ -1098,6 +1098,498 @@ fn add_tab(notebook: &gtk::Notebook, window: &ApplicationWindow, bin: Rc<String>
     notebook.set_current_page(Some(idx));
 }
 
+// ── Read-only management panel (see DESIGN.md) ───────────────────────────
+//
+// Thin transport: shell out to `claude plugin …` (JSON where available) or
+// read config files directly; parse defensively; never execute a server or
+// print a secret. v1 is browse-only — no installs, no config writes.
+
+#[derive(Clone, Copy)]
+enum ManageKind {
+    PluginsInstalled,
+    PluginsAvailable,
+    Marketplaces,
+    Mcp,
+    Skills,
+}
+
+fn trunc(s: &str, n: usize) -> String {
+    if s.len() > n {
+        format!("{}\n…(truncated)", &s[..n])
+    } else {
+        s.to_string()
+    }
+}
+
+fn claude_json(bin: &str, args: &[&str]) -> Result<serde_json::Value, String> {
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run `claude {}`: {e}", args.join(" ")))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(format!(
+            "`claude {}` failed ({})\n{}",
+            args.join(" "),
+            out.status,
+            stderr.trim()
+        ));
+    }
+    serde_json::from_str(stdout.trim()).map_err(|e| {
+        format!(
+            "could not parse JSON from `claude {}` ({e}); raw output:\n{}",
+            args.join(" "),
+            trunc(stdout.trim(), 4000)
+        )
+    })
+}
+
+fn fmt_plugins(v: &serde_json::Value) -> String {
+    let arr = v
+        .as_array()
+        .cloned()
+        .or_else(|| v.get("plugins").and_then(|p| p.as_array()).cloned());
+    let arr = match arr {
+        Some(a) => a,
+        None => {
+            return format!(
+                "(unexpected JSON shape; showing raw)\n{}",
+                trunc(&serde_json::to_string_pretty(v).unwrap_or_default(), 4000)
+            )
+        }
+    };
+    if arr.is_empty() {
+        return "(none)".into();
+    }
+    let mut s = String::new();
+    for it in &arr {
+        let g = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let name = if g("name").is_empty() {
+            it.get("name").map(|x| x.to_string()).unwrap_or_default()
+        } else {
+            g("name").to_string()
+        };
+        let ver = g("version");
+        let mkt = g("marketplace");
+        let enabled = it
+            .get("enabled")
+            .and_then(|x| x.as_bool())
+            .map(|b| if b { "enabled" } else { "disabled" })
+            .unwrap_or("");
+        let desc = g("description");
+        s.push_str(&format!("• {name}"));
+        if !ver.is_empty() {
+            s.push_str(&format!("  v{ver}"));
+        }
+        if !mkt.is_empty() {
+            s.push_str(&format!("  @{mkt}"));
+        }
+        if !enabled.is_empty() {
+            s.push_str(&format!("  [{enabled}]"));
+        }
+        s.push('\n');
+        if !desc.is_empty() {
+            s.push_str(&format!("    {desc}\n"));
+        }
+    }
+    s
+}
+
+/// Walk ~/.claude.json for every `mcpServers` map (top-level = user scope,
+/// `projects.<path>.mcpServers` = that project). Secrets are never printed.
+fn report_mcp() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = format!("{home}/.claude.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) => return format!("cannot read {path}: {e}"),
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => return format!("{path} is not valid JSON: {e}"),
+    };
+    let mut out = String::new();
+    let mut emit = |scope: &str, servers: &serde_json::Value| {
+        if let Some(map) = servers.as_object() {
+            if map.is_empty() {
+                return;
+            }
+            out.push_str(&format!("[{scope}]\n"));
+            for (name, cfg) in map {
+                let t = cfg
+                    .get("type")
+                    .or_else(|| cfg.get("transport"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("stdio");
+                let loc = cfg
+                    .get("url")
+                    .and_then(|x| x.as_str())
+                    .map(|u| {
+                        // host only — no query/token in path
+                        u.split('/').take(3).collect::<Vec<_>>().join("/")
+                    })
+                    .or_else(|| {
+                        cfg.get("command").and_then(|x| x.as_str()).map(String::from)
+                    })
+                    .unwrap_or_default();
+                let nenv = cfg
+                    .get("env")
+                    .and_then(|x| x.as_object())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let nhdr = cfg
+                    .get("headers")
+                    .and_then(|x| x.as_object())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                out.push_str(&format!("  • {name}  ({t})  {loc}"));
+                if nenv > 0 {
+                    out.push_str(&format!("  (env: {nenv} hidden)"));
+                }
+                if nhdr > 0 {
+                    out.push_str(&format!("  (headers: {nhdr} hidden)"));
+                }
+                out.push('\n');
+            }
+        }
+    };
+    if let Some(s) = v.get("mcpServers") {
+        emit("user", s);
+    }
+    if let Some(projs) = v.get("projects").and_then(|p| p.as_object()) {
+        for (proj, pv) in projs {
+            if let Some(s) = pv.get("mcpServers") {
+                emit(proj, s);
+            }
+        }
+    }
+    if out.is_empty() {
+        "(no mcpServers configured in ~/.claude.json)".into()
+    } else {
+        out.push_str("\nSecrets (env/headers values) are intentionally hidden.");
+        out
+    }
+}
+
+fn scan_skills(dir: &Path, label: &str, out: &mut String) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut any = false;
+    for ent in rd.flatten() {
+        if !ent.path().is_dir() {
+            continue;
+        }
+        let name = ent.file_name().to_string_lossy().to_string();
+        let sk = ent.path().join("SKILL.md");
+        let desc = std::fs::read_to_string(&sk)
+            .ok()
+            .and_then(|c| {
+                c.lines()
+                    .map(|l| l.trim())
+                    .find(|l| {
+                        !l.is_empty() && !l.starts_with("---") && !l.starts_with('#')
+                    })
+                    .map(|l| l.chars().take(100).collect::<String>())
+            })
+            .unwrap_or_default();
+        if !any {
+            out.push_str(&format!("[{label}] {}\n", dir.display()));
+            any = true;
+        }
+        out.push_str(&format!("  • {name}"));
+        if !desc.is_empty() {
+            out.push_str(&format!(" — {desc}"));
+        }
+        out.push('\n');
+    }
+}
+
+fn report_skills() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = String::new();
+    scan_skills(Path::new(&format!("{home}/.claude/skills")), "user", &mut out);
+    if let Ok(cwd) = std::env::current_dir() {
+        scan_skills(&cwd.join(".claude/skills"), "project (cwd)", &mut out);
+    }
+    if out.is_empty() {
+        out.push_str("(no filesystem skills in ~/.claude/skills or ./.claude/skills)\n");
+    }
+    out.push_str(
+        "\nPlugin-bundled skills are not listed here — see the Plugins tabs \
+         (a skill ships inside its plugin).",
+    );
+    out
+}
+
+fn manage_fetch(kind: ManageKind, bin: &str) -> String {
+    match kind {
+        ManageKind::PluginsInstalled => {
+            match claude_json(bin, &["plugin", "list", "--json"]) {
+                Ok(v) => fmt_plugins(&v),
+                Err(e) => e,
+            }
+        }
+        ManageKind::PluginsAvailable => {
+            match claude_json(bin, &["plugin", "list", "--available", "--json"]) {
+                Ok(v) => fmt_plugins(&v),
+                Err(e) => e,
+            }
+        }
+        ManageKind::Marketplaces => {
+            match Command::new(bin)
+                .args(["plugin", "marketplace", "list"])
+                .output()
+            {
+                Ok(o) => {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    let e = String::from_utf8_lossy(&o.stderr);
+                    let body = if s.trim().is_empty() { e } else { s };
+                    let body = body.trim();
+                    if body.is_empty() {
+                        "(no marketplaces configured)".into()
+                    } else {
+                        trunc(body, 8000)
+                    }
+                }
+                Err(e) => format!("failed to run `claude plugin marketplace list`: {e}"),
+            }
+        }
+        ManageKind::Mcp => report_mcp(),
+        ManageKind::Skills => report_skills(),
+    }
+}
+
+// v2: confirmed mutating action. Shows the exact `claude …` command, runs
+// it off-thread only on confirm, prints stdout+stderr, then refreshes.
+// Secrets are never placed in argv by the UI itself (MCP add is deferred).
+fn confirm_and_run(
+    win: &gtk::Window,
+    bin: Rc<String>,
+    argv: Vec<String>,
+    view: gtk::TextView,
+    status: gtk::Label,
+    reload: Rc<dyn Fn()>,
+) {
+    let pretty = format!("claude {}", argv.join(" "));
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Run this command?")
+        .detail(format!(
+            "{pretty}\n\nThis runs the Claude Code CLI and may execute \
+             third-party code on your machine."
+        ))
+        .buttons(["Cancel", "Run"].as_slice())
+        .cancel_button(0)
+        .default_button(0)
+        .build();
+    dialog.choose(Some(win), gtk::gio::Cancellable::NONE, move |res| {
+        if !matches!(res, Ok(1)) {
+            return; // Cancel / Esc
+        }
+        status.set_text("running…");
+        let (tx, rx) = async_channel::bounded::<String>(1);
+        let bin2 = (*bin).clone();
+        let argv2 = argv.clone();
+        std::thread::spawn(move || {
+            let msg = match Command::new(&bin2).args(&argv2).output() {
+                Ok(o) => format!(
+                    "$ claude {}\n[exit {}]\n\n{}{}",
+                    argv2.join(" "),
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr),
+                ),
+                Err(e) => {
+                    format!("$ claude {}\n\nfailed to launch: {e}", argv2.join(" "))
+                }
+            };
+            let _ = tx.send_blocking(msg);
+        });
+        let view = view.clone();
+        let status = status.clone();
+        let reload = reload.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(text) = rx.recv().await {
+                view.buffer().set_text(&text);
+                status.set_text("");
+                reload(); // re-list so the change is visible
+            }
+        });
+    });
+}
+
+fn manage_page(win: &gtk::Window, bin: Rc<String>, kind: ManageKind) -> gtk::Widget {
+    let v = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    v.set_margin_top(6);
+    v.set_margin_bottom(6);
+    v.set_margin_start(6);
+    v.set_margin_end(6);
+
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let refresh = gtk::Button::with_label("↻ Refresh");
+    let status = gtk::Label::new(Some("loading…"));
+    bar.append(&refresh);
+    bar.append(&status);
+
+    let view = gtk::TextView::new();
+    view.set_editable(false);
+    view.set_monospace(true);
+    view.set_cursor_visible(false);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_child(Some(&view));
+
+    v.append(&bar);
+
+    let reload: Rc<dyn Fn()> = {
+        let view = view.clone();
+        let status = status.clone();
+        let bin = bin.clone();
+        Rc::new(move || {
+            status.set_text("loading…");
+            view.buffer().set_text("");
+            let (tx, rx) = async_channel::bounded::<String>(1);
+            let bin2 = (*bin).clone();
+            std::thread::spawn(move || {
+                let _ = tx.send_blocking(manage_fetch(kind, &bin2));
+            });
+            let view = view.clone();
+            let status = status.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(text) = rx.recv().await {
+                    view.buffer().set_text(&text);
+                    status.set_text("");
+                }
+            });
+        })
+    };
+    refresh.connect_clicked({
+        let reload = reload.clone();
+        move |_| reload()
+    });
+
+    // v2 action bar (confirmed mutations). Read-only listing stays above.
+    let mut spec_buttons: Vec<(&str, &str, bool)> = Vec::new(); // label, subcmd, allow-empty
+    let (placeholder, prefix): (&str, Vec<&str>) = match kind {
+        ManageKind::PluginsInstalled | ManageKind::PluginsAvailable => {
+            spec_buttons = vec![
+                ("Install", "install", false),
+                ("Enable", "enable", false),
+                ("Disable", "disable", false),
+                ("Uninstall", "uninstall", false),
+                ("Update", "update", false),
+            ];
+            ("plugin  or  plugin@marketplace", vec!["plugin"])
+        }
+        ManageKind::Marketplaces => {
+            spec_buttons = vec![
+                ("Add", "add", false),
+                ("Remove", "remove", false),
+                ("Update", "update", true), // blank = update all
+            ];
+            (
+                "<url | github-owner/repo | path>  (Update: blank = all)",
+                vec!["plugin", "marketplace"],
+            )
+        }
+        ManageKind::Mcp => {
+            spec_buttons = vec![("Remove", "remove", false)];
+            ("MCP server name to remove", vec!["mcp"])
+        }
+        ManageKind::Skills => ("", vec![]),
+    };
+
+    if !spec_buttons.is_empty() {
+        let abar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let ent = gtk::Entry::new();
+        ent.set_hexpand(true);
+        ent.set_placeholder_text(Some(placeholder));
+        abar.append(&ent);
+        for (label, sub, allow_empty) in spec_buttons {
+            let b = gtk::Button::with_label(label);
+            let ent = ent.clone();
+            let win = win.clone();
+            let bin = bin.clone();
+            let view = view.clone();
+            let status = status.clone();
+            let reload = reload.clone();
+            let prefix: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+            let sub = sub.to_string();
+            b.connect_clicked(move |_| {
+                let spec = ent.text().trim().to_string();
+                if spec.is_empty() && !allow_empty {
+                    status.set_text("enter a value first");
+                    return;
+                }
+                let mut argv = prefix.clone();
+                argv.push(sub.clone());
+                if !spec.is_empty() {
+                    argv.push(spec.clone());
+                }
+                confirm_and_run(
+                    &win,
+                    bin.clone(),
+                    argv,
+                    view.clone(),
+                    status.clone(),
+                    reload.clone(),
+                );
+            });
+            abar.append(&b);
+        }
+        v.append(&abar);
+    }
+
+    let note = match kind {
+        ManageKind::Mcp => Some(
+            "Add (multi-field form + secret handling) is deferred to v2.1 — \
+             use `claude mcp add …` in a terminal for now.",
+        ),
+        ManageKind::Skills => Some(
+            "No first-party skill install. Install a plugin that bundles \
+             skills via the Plugins tabs.",
+        ),
+        _ => None,
+    };
+    if let Some(n) = note {
+        let l = gtk::Label::new(Some(n));
+        l.set_wrap(true);
+        l.set_xalign(0.0);
+        v.append(&l);
+    }
+
+    v.append(&scroll);
+    reload();
+    v.upcast()
+}
+
+fn open_manage_window(parent: &ApplicationWindow, bin: Rc<String>) {
+    let win = gtk::Window::builder()
+        .title("Manage — Plugins / MCP / Skills")
+        .transient_for(parent)
+        .default_width(840)
+        .default_height(640)
+        .build();
+    let nb = gtk::Notebook::new();
+    nb.set_scrollable(true);
+    for (title, kind) in [
+        ("Plugins (installed)", ManageKind::PluginsInstalled),
+        ("Plugins (available)", ManageKind::PluginsAvailable),
+        ("Marketplaces", ManageKind::Marketplaces),
+        ("MCP servers", ManageKind::Mcp),
+        ("Skills", ManageKind::Skills),
+    ] {
+        let page = manage_page(&win, bin.clone(), kind);
+        nb.append_page(&page, Some(&gtk::Label::new(Some(title))));
+    }
+    win.set_child(Some(&nb));
+    win.present();
+}
+
 fn build_ui(app: &Application) {
     let bin = Rc::new(resolve_claude());
 
@@ -1107,6 +1599,11 @@ fn build_ui(app: &Application) {
     toolbar.set_margin_start(6);
     let new_btn = gtk::Button::with_label("➕ New session");
     toolbar.append(&new_btn);
+    let manage_btn = gtk::Button::with_label("🧩 Manage");
+    manage_btn.set_tooltip_text(Some(
+        "Browse installed/available plugins, MCP servers, skills (read-only)",
+    ));
+    toolbar.append(&manage_btn);
 
     let notebook = gtk::Notebook::new();
     notebook.set_vexpand(true);
@@ -1137,6 +1634,11 @@ fn build_ui(app: &Application) {
         let window = window.clone();
         let bin = bin.clone();
         new_btn.connect_clicked(move |_| add_tab(&notebook, &window, bin.clone()));
+    }
+    {
+        let window = window.clone();
+        let bin = bin.clone();
+        manage_btn.connect_clicked(move |_| open_manage_window(&window, bin.clone()));
     }
 
     add_tab(&notebook, &window, bin.clone());
