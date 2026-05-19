@@ -115,5 +115,5 @@ done
 
 ## License
 
-**Not chosen yet (TBD).** No license file included on purpose; default
-copyright applies until one is added.
+**MIT** — see [`LICENSE`](LICENSE). Use it, modify it, redistribute it,
+commercial or not; just keep the copyright notice. No warranty.

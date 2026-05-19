@@ -2,6 +2,7 @@
 name = "claude-code-linux-gui"
 version = "0.5.2"
 edition = "2021"
+license = "MIT"
 description = "A native (GTK4, no Electron) Linux GUI for the official Claude Code CLI: persistent per-session process, streaming output, multi-session, per-session permission mode, full tools, Markdown rendering. Not affiliated with Anthropic."
 
 [dependencies]
@@ -12,12 +13,11 @@ async-channel = "2"
 webkit6 = "0.4"
 pulldown-cmark = "0.12"
 
-# `cargo deb` packaging. License is intentionally undecided (see README);
-# the generated copyright file states the default "all rights reserved".
+# `cargo deb` packaging. MIT licensed (see LICENSE).
 [package.metadata.deb]
 maintainer = "Topias <topiastsui@gmail.com>"
-copyright = "No license chosen yet; all rights reserved by the author. Not affiliated with Anthropic."
-license-file = ["LICENSE.deb.txt", "0"]
+copyright = "Copyright (c) 2026 Topias. MIT licensed. Not affiliated with Anthropic."
+license-file = ["LICENSE", "0"]
 extended-description = """\
 Native GTK4 (no Electron) desktop GUI wrapping the official Claude Code CLI: \
 persistent per-session process over stream-json, streaming Markdown output, \
