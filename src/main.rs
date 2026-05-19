@@ -192,6 +192,9 @@ struct Session {
     pending_approval: bool,
     pending_dirs: Vec<String>,
     allowed_dirs: Vec<String>,
+    // Pasted images saved to the workdir but not yet sent — they ride along
+    // with the next normal message so you can keep typing after pasting.
+    pending_images: Vec<PathBuf>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     // Route-A state. `overrides` are extra (flag, value) pairs applied at
@@ -882,6 +885,7 @@ fn handle_command(tab: &Tab, line: &str) -> bool {
                 s.session_id = None;
                 s.pending_approval = false;
                 s.pending_dirs.clear();
+                s.pending_images.clear();
                 s.cmd_pending = false;
                 s.cmd_recovering = false;
             }
@@ -1093,13 +1097,18 @@ fn build_session_tab(
         let tab_s = tab.clone();
         send.connect_clicked(move |_| {
             let msg = tv_text(&tab_s.entry);
-            if msg.trim().is_empty() {
+            let has_imgs = !tab_s.sess.borrow().pending_images.is_empty();
+            if msg.trim().is_empty() && !has_imgs {
                 return;
             }
             // Route a leading `/` through the command dispatcher. A recognised
             // command is consumed here; an unknown one falls through and is
-            // sent verbatim (Route D).
-            if msg.trim_start().starts_with('/') && handle_command(&tab_s, msg.trim()) {
+            // sent verbatim (Route D). Pending images are NOT consumed by a
+            // command — they stay attached for the next real message.
+            if !msg.trim().is_empty()
+                && msg.trim_start().starts_with('/')
+                && handle_command(&tab_s, msg.trim())
+            {
                 tv_clear(&tab_s.entry);
                 return;
             }
@@ -1107,9 +1116,28 @@ fn build_session_tab(
                 push_msg(&tab_s, "System", "No running session. Choose a folder first.");
                 return;
             }
+            // Drain attached images and fold their paths into the sent text
+            // (Read inside the workdir needs no permission).
+            let imgs: Vec<PathBuf> =
+                std::mem::take(&mut tab_s.sess.borrow_mut().pending_images);
+            let (sent, you) = if imgs.is_empty() {
+                (msg.clone(), msg.clone())
+            } else {
+                let paths = imgs
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let n = imgs.len();
+                let sent = format!(
+                    "我粘贴了 {n} 张图片，请先用 Read 工具查看这些文件再回答：\n\
+                     {paths}\n\n{msg}"
+                );
+                (sent, format!("[附图 {n} 张] {msg}").trim().to_string())
+            };
             tv_clear(&tab_s.entry);
-            push_msg(&tab_s, "You", &msg);
-            send_turn(&tab_s, &msg);
+            push_msg(&tab_s, "You", &you);
+            send_turn(&tab_s, &sent);
         });
     }
     {
@@ -1188,18 +1216,21 @@ fn build_session_tab(
                     let path = wd.join(&fname);
                     match tex.save_to_png(&path) {
                         Ok(()) => {
-                            let extra = tv_text(&tab_c.entry);
-                            tv_clear(&tab_c.entry);
+                            // Attach, don't send: keep typing; it rides with
+                            // the next normal message.
+                            let n = {
+                                let mut s = tab_c.sess.borrow_mut();
+                                s.pending_images.push(path.clone());
+                                s.pending_images.len()
+                            };
                             push_msg(
                                 &tab_c,
-                                "You",
-                                &format!("[pasted image: {fname}] {extra}"),
+                                "System",
+                                &format!(
+                                    "📎 image attached: {fname} ({n} pending) — \
+                                     keep typing; it sends with your next message.",
+                                ),
                             );
-                            let p = path.to_string_lossy();
-                            let msg = format!(
-                                "我粘贴了一张图片，请先用 Read 工具查看这个文件，再回答：\n{p}\n{extra}"
-                            );
-                            send_turn(&tab_c, &msg);
                         }
                         Err(e) => push_msg(
                             &tab_c,
