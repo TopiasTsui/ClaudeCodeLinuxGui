@@ -17,7 +17,9 @@ official **Claude Code** CLI on Linux.
 ## Features
 
 - **Multiple sessions** — tabs (`➕ New session`); each is an independent
-  conversation (own folder, history, approved dirs).
+  conversation (own folder, history, approved dirs). Close one with the
+  **✕** on its tab or the `/exit` command (kills that session's `claude`
+  process). Switching tabs puts the cursor straight in that session's input.
 - **Streaming output** with Markdown rendering; live tool / thinking status.
 - **Multi-line input**: **Alt+Enter sends**; plain **Enter inserts a
   newline** and (importantly) commits a CJK/IME composition without sending.
@@ -30,7 +32,7 @@ official **Claude Code** CLI on Linux.
 - **Built-in commands** (a leading `/`; unknown `/x` is sent verbatim),
   with `/`-prefix autocomplete from the registry:
   `/model`, `/permission-mode`, `/effort`, `/worktree`, `/fork-session`,
-  `/clear`, `/status`, `/help`. See `DESIGN.md`.
+  `/clear`, `/status`, `/help`, `/exit`. See `DESIGN.md`.
 - **📎 Image** — paste a clipboard image; it is *attached* (saved to the
   workdir) so you can keep typing, and rides with your next message.
 - **📄 File** — insert a file path (workdir-relative when inside) into the
@@ -77,17 +79,21 @@ sudo ./install-apparmor.sh
 ### Build a .deb (distributable / other machines)
 
 ```bash
-cargo install cargo-deb     # once
-cargo deb                   # -> target/debian/claude-code-linux-gui_<ver>_amd64.deb
-sudo apt install ./target/debian/claude-code-linux-gui_*.deb
+pkg/build-deb.sh            # -> dist/claude-code-linux-gui_<ver>_<arch>.deb
+sudo apt install ./dist/claude-code-linux-gui_*.deb
 ```
 
+Builds the release binary first (`pkg/build-deb.sh --no-build` reuses an
+existing `target/release` binary) and packages with `dpkg-deb`. Needs
+`dpkg-deb` + `dpkg-architecture` (Debian/Ubuntu base; `dpkg-dev`). Version
+is read from `Cargo.toml`, architecture from `dpkg-architecture`.
+
 Installs the binary to `/usr/bin`, the icon/`.desktop`, and the AppArmor
-profile to `/etc/apparmor.d` (a conffile). The package's `postinst` loads
-the AppArmor profile automatically, so the separate `install-apparmor.sh`
-step is **not** needed when installing via the `.deb`. Declared runtime
-deps: `libgtk-4-1`, `libwebkitgtk-6.0-4`. Remove with
-`sudo apt remove claude-code-linux-gui` (unloads the profile).
+profile to `/etc/apparmor.d`. The package's `postinst` loads the AppArmor
+profile automatically, so the separate `install-apparmor.sh` step is
+**not** needed when installing via the `.deb`. Declared runtime deps:
+`libc6`, `libgtk-4-1`, `libwebkitgtk-6.0-4`. Remove with
+`sudo apt remove claude-code-linux-gui` (the `prerm` unloads the profile).
 
 ### Note: single-instance app
 
