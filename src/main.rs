@@ -307,7 +307,7 @@ struct Tab {
     // a spurious "session ended".
     gen: Rc<Cell<u64>>,
     web: webkit6::WebView,
-    entry: gtk::Entry,
+    entry: gtk::TextView,
     img: gtk::Button,
     file: gtk::Button,
     send: gtk::Button,
@@ -344,6 +344,15 @@ fn ui_dead(tab: &Tab) {
     tab.file.set_sensitive(false);
     tab.send.set_sensitive(false);
     tab.stop.set_sensitive(false);
+}
+
+// The input is a multi-line TextView; these centralise buffer text access.
+fn tv_text(tv: &gtk::TextView) -> String {
+    let b = tv.buffer();
+    b.text(&b.start_iter(), &b.end_iter(), false).to_string()
+}
+fn tv_clear(tv: &gtk::TextView) {
+    tv.buffer().set_text("");
 }
 
 fn parse_result(v: &serde_json::Value) -> TurnResult {
@@ -958,12 +967,43 @@ fn build_session_tab(
     web.set_vexpand(true);
 
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let entry = gtk::Entry::new();
-    entry.set_hexpand(true);
-    entry.set_placeholder_text(Some(
-        "Message Claude Code…  (Enter to send · /help for commands)",
-    ));
+    // Multi-line input: TextView in a height-bounded ScrolledWindow, with a
+    // manual placeholder (TextView has no built-in one). Enter sends;
+    // Shift+Enter inserts a newline (handled by a key controller below).
+    let entry = gtk::TextView::new();
+    entry.set_wrap_mode(gtk::WrapMode::WordChar);
+    entry.set_accepts_tab(false);
+    entry.set_top_margin(4);
+    entry.set_bottom_margin(4);
+    entry.set_left_margin(6);
+    entry.set_right_margin(6);
     entry.set_sensitive(false);
+    let entry_scroll = gtk::ScrolledWindow::new();
+    entry_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    entry_scroll.set_min_content_height(64);
+    entry_scroll.set_max_content_height(180);
+    entry_scroll.set_propagate_natural_height(true);
+    entry_scroll.set_child(Some(&entry));
+    let placeholder = gtk::Label::new(Some(
+        "Message Claude Code…  (Enter sends · Shift+Enter newline · /help)",
+    ));
+    placeholder.add_css_class("dim-label");
+    placeholder.set_xalign(0.0);
+    placeholder.set_yalign(0.0);
+    placeholder.set_margin_top(6);
+    placeholder.set_margin_start(8);
+    placeholder.set_can_target(false);
+    let entry_overlay = gtk::Overlay::new();
+    entry_overlay.set_hexpand(true);
+    entry_overlay.set_child(Some(&entry_scroll));
+    entry_overlay.add_overlay(&placeholder);
+    {
+        // Show the placeholder only while the buffer is empty.
+        let placeholder = placeholder.clone();
+        entry.buffer().connect_changed(move |b| {
+            placeholder.set_visible(b.char_count() == 0);
+        });
+    }
     let img = gtk::Button::with_label("📎 Image");
     img.set_tooltip_text(Some("Paste an image from the clipboard and send it"));
     img.set_sensitive(false);
@@ -979,7 +1019,7 @@ fn build_session_tab(
     stop.set_sensitive(false);
     let send = gtk::Button::with_label("Send");
     send.set_sensitive(false);
-    bottom.append(&entry);
+    bottom.append(&entry_overlay);
     bottom.append(&img);
     bottom.append(&file);
     bottom.append(&approve);
@@ -1052,7 +1092,7 @@ fn build_session_tab(
     {
         let tab_s = tab.clone();
         send.connect_clicked(move |_| {
-            let msg = tab_s.entry.text().to_string();
+            let msg = tv_text(&tab_s.entry);
             if msg.trim().is_empty() {
                 return;
             }
@@ -1060,21 +1100,35 @@ fn build_session_tab(
             // command is consumed here; an unknown one falls through and is
             // sent verbatim (Route D).
             if msg.trim_start().starts_with('/') && handle_command(&tab_s, msg.trim()) {
-                tab_s.entry.set_text("");
+                tv_clear(&tab_s.entry);
                 return;
             }
             if tab_s.sess.borrow().stdin.is_none() {
                 push_msg(&tab_s, "System", "No running session. Choose a folder first.");
                 return;
             }
-            tab_s.entry.set_text("");
+            tv_clear(&tab_s.entry);
             push_msg(&tab_s, "You", &msg);
             send_turn(&tab_s, &msg);
         });
     }
     {
+        // Enter sends; Shift+Enter inserts a newline (default TextView
+        // behaviour when we don't consume the key).
         let send = send.clone();
-        entry.connect_activate(move |_| send.emit_clicked());
+        let kc = gtk::EventControllerKey::new();
+        kc.set_propagation_phase(gtk::PropagationPhase::Capture);
+        kc.connect_key_pressed(move |_, key, _, mods| {
+            if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                && !mods.contains(gtk::gdk::ModifierType::SHIFT_MASK)
+            {
+                send.emit_clicked();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        entry.add_controller(kc);
     }
 
     {
@@ -1134,8 +1188,8 @@ fn build_session_tab(
                     let path = wd.join(&fname);
                     match tex.save_to_png(&path) {
                         Ok(()) => {
-                            let extra = tab_c.entry.text().to_string();
-                            tab_c.entry.set_text("");
+                            let extra = tv_text(&tab_c.entry);
+                            tv_clear(&tab_c.entry);
                             push_msg(
                                 &tab_c,
                                 "You",
@@ -1197,14 +1251,13 @@ fn build_session_tab(
                             }
                         };
                         let e = &tab_f.entry;
-                        let mut pos = e.position();
-                        let ins = if e.text().is_empty() {
+                        let buf = e.buffer();
+                        let ins = if buf.char_count() == 0 {
                             txt
                         } else {
                             format!(" {txt} ")
                         };
-                        e.insert_text(&ins, &mut pos);
-                        e.set_position(pos);
+                        buf.insert_at_cursor(&ins);
                         e.grab_focus();
                     }
                 }
@@ -1256,8 +1309,8 @@ fn build_session_tab(
             let pop = pop.clone();
             let list = list.clone();
             let names = names.clone();
-            entry.connect_changed(move |e| {
-                let t = e.text();
+            entry.buffer().connect_changed(move |b| {
+                let t = b.text(&b.start_iter(), &b.end_iter(), false);
                 let t = t.as_str();
                 let tok = t.split_whitespace().next().unwrap_or("");
                 if !t.starts_with('/') || tok.is_empty() {
@@ -1297,8 +1350,9 @@ fn build_session_tab(
                     return;
                 }
                 if let Some(name) = names.borrow().get(i as usize).copied() {
-                    entry.set_text(&format!("{name} "));
-                    entry.set_position(-1);
+                    let buf = entry.buffer();
+                    buf.set_text(&format!("{name} "));
+                    buf.place_cursor(&buf.end_iter());
                     pop.popdown();
                     entry.grab_focus();
                 }
