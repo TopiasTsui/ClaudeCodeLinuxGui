@@ -251,3 +251,38 @@ panel pattern.
 Cross-cutting: control-protocol interrupt and the session-file format are
 the two runtime-unknowns; both degrade safely (respawn / file list) if the
 probe fails.
+
+---
+
+# Feature batch 2: new-session options + Settings
+
+## New-session options = Route-A commands, not a dialog
+
+Decision: `worktree` / `fork-session` / `effort` are exposed through the
+existing command registry, **not** a new-session dialog. Rationale:
+consistency with the command design, zero UI bloat, rollback-safe, and the
+CLI stays the validator (no enumerated levels in the GUI). They take effect
+on the next spawn — issue them in a fresh tab before the first turn to act
+as "new-session" options; mid-session they just respawn with `--resume`.
+
+- `/effort [level]` → `Route::RespawnFlag("--effort")` (same shape as
+  `/model`; value passed verbatim, CLI validates the level).
+- `/worktree [off]` → new `Route::RespawnBool("--worktree")`.
+- `/fork-session [off]` → `Route::RespawnBool("--fork-session")`.
+
+`Route::RespawnBool` is a **valueless** spawn flag stored in `overrides`
+with an empty value; `spawn_proc` emits just the flag (no value) for empty
+entries. `/<cmd>` enables it, `/<cmd> off` removes it. An invalid flag or
+combination (e.g. `--worktree` outside a git repo, `--fork-session` without
+resume) is the CLI's call — the existing rollback invariant reverts it and
+surfaces the stderr. Named worktrees are **not** supported (the CLI
+auto-names); that edge is intentionally out of scope.
+
+## Settings = raw JSON editor
+
+`⚙ Settings` opens `~/.claude/settings.json` in a monospace editable view.
+Thin transport: **the GUI does not model the settings schema** — no form,
+no field validation against Anthropic's keys. Save only checks the text
+parses as JSON, copies the existing file to `settings.json.bak`, then
+writes. Reload re-reads. A missing file shows `{}`. Project-scope settings
+are out of v1 (no session-workdir binding here).

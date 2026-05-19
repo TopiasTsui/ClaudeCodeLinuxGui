@@ -57,6 +57,10 @@ enum Route {
     /// Set a spawn flag from the verbatim argument, respawn with `--resume`
     /// (context carries). The CLI validates the value.
     RespawnFlag(&'static str),
+    /// A valueless spawn flag (e.g. `--fork-session`). `/<cmd>` enables it,
+    /// `/<cmd> off` removes it; respawn with `--resume`. CLI validates the
+    /// flag/combination (rollback covers an invalid one).
+    RespawnBool(&'static str),
     /// Respawn WITHOUT `--resume`: fresh session + cleared transcript.
     Clear,
     /// Answered locally by the GUI; no model round-trip.
@@ -89,6 +93,24 @@ const COMMANDS: &[Cmd] = &[
         route: Route::RespawnFlag("--permission-mode"),
         usage: "/permission-mode <mode>",
         help: "set permission mode (overrides the dropdown); CLI validates",
+    },
+    Cmd {
+        name: "/effort",
+        route: Route::RespawnFlag("--effort"),
+        usage: "/effort [level]",
+        help: "set effort level (no arg: show current); value passed to the CLI as-is",
+    },
+    Cmd {
+        name: "/worktree",
+        route: Route::RespawnBool("--worktree"),
+        usage: "/worktree [off]",
+        help: "run this session in a new git worktree (CLI auto-names it)",
+    },
+    Cmd {
+        name: "/fork-session",
+        route: Route::RespawnBool("--fork-session"),
+        usage: "/fork-session [off]",
+        help: "on resume, branch a new session id instead of reusing it",
     },
     Cmd {
         name: "/clear",
@@ -433,7 +455,11 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
         if flag == "--permission-mode" {
             continue;
         }
-        cmd.arg(flag).arg(val);
+        if val.is_empty() {
+            cmd.arg(flag); // valueless flag (RespawnBool)
+        } else {
+            cmd.arg(flag).arg(val);
+        }
     }
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -809,6 +835,33 @@ fn handle_command(tab: &Tab, line: &str) -> bool {
         Route::Local(Local::Status) => {
             let t = status_text(tab);
             push_msg(tab, "System", &t);
+        }
+        Route::RespawnBool(flag) => {
+            let flag: &str = flag;
+            if tab.sess.borrow().workdir.is_none() {
+                push_msg(tab, "System", "Choose a folder first.");
+                return true;
+            }
+            let off = arg.eq_ignore_ascii_case("off");
+            {
+                let mut s = tab.sess.borrow_mut();
+                if off {
+                    s.overrides.retain(|(f, _)| f != flag);
+                } else {
+                    set_override(&mut s, flag, "");
+                }
+                s.cmd_pending = true;
+                s.cmd_recovering = false;
+            }
+            push_msg(
+                tab,
+                "System",
+                &format!(
+                    "{name} {} (restarting session; context kept)",
+                    if off { "removed" } else { "enabled" }
+                ),
+            );
+            spawn_proc(tab, false);
         }
         Route::Clear => {
             if tab.sess.borrow().workdir.is_none() {
@@ -2092,6 +2145,89 @@ fn open_resume_window(
     win.present();
 }
 
+// Settings: a raw JSON editor for ~/.claude/settings.json. Thin transport —
+// the GUI does not model the settings schema. Save validates the JSON parses,
+// backs the old file up to settings.json.bak, then writes. No schema form.
+fn open_settings_window(parent: &ApplicationWindow) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = PathBuf::from(format!("{home}/.claude/settings.json"));
+
+    let win = gtk::Window::builder()
+        .title("Settings — ~/.claude/settings.json (raw JSON)")
+        .transient_for(parent)
+        .default_width(820)
+        .default_height(620)
+        .build();
+    let v = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    v.set_margin_top(6);
+    v.set_margin_bottom(6);
+    v.set_margin_start(6);
+    v.set_margin_end(6);
+
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let reload = gtk::Button::with_label("↻ Reload");
+    let save = gtk::Button::with_label("💾 Save");
+    let status = gtk::Label::new(Some(""));
+    status.set_xalign(0.0);
+    bar.append(&reload);
+    bar.append(&save);
+    bar.append(&status);
+
+    let view = gtk::TextView::new();
+    view.set_monospace(true);
+    view.set_wrap_mode(gtk::WrapMode::None);
+    let sc = gtk::ScrolledWindow::new();
+    sc.set_vexpand(true);
+    sc.set_child(Some(&view));
+
+    v.append(&bar);
+    v.append(&sc);
+    win.set_child(Some(&v));
+
+    let do_load = {
+        let view = view.clone();
+        let status = status.clone();
+        let path = path.clone();
+        move || {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| "{\n}\n".to_string());
+            view.buffer().set_text(&text);
+            status.set_text(&format!("{}", path.display()));
+        }
+    };
+    do_load();
+    reload.connect_clicked({
+        let do_load = do_load.clone();
+        move |_| do_load()
+    });
+
+    save.connect_clicked({
+        let view = view.clone();
+        let status = status.clone();
+        let path = path.clone();
+        move |_| {
+            let b = view.buffer();
+            let text = b.text(&b.start_iter(), &b.end_iter(), false).to_string();
+            if let Err(e) = serde_json::from_str::<serde_json::Value>(&text) {
+                status.set_text(&format!("NOT saved — invalid JSON: {e}"));
+                return;
+            }
+            if path.exists() {
+                let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+            }
+            match std::fs::write(&path, text.as_bytes()) {
+                Ok(()) => status.set_text(&format!(
+                    "saved (backup: {})",
+                    path.with_extension("json.bak").display()
+                )),
+                Err(e) => status.set_text(&format!("write failed: {e}")),
+            }
+        }
+    });
+
+    win.present();
+}
+
 fn build_ui(app: &Application) {
     let bin = Rc::new(resolve_claude());
 
@@ -2111,6 +2247,11 @@ fn build_ui(app: &Application) {
         "Resume a previous session from ~/.claude/projects",
     ));
     toolbar.append(&resume_btn);
+    let settings_btn = gtk::Button::with_label("⚙ Settings");
+    settings_btn.set_tooltip_text(Some(
+        "Edit ~/.claude/settings.json (raw JSON; backup on save)",
+    ));
+    toolbar.append(&settings_btn);
 
     let notebook = gtk::Notebook::new();
     notebook.set_vexpand(true);
@@ -2154,6 +2295,10 @@ fn build_ui(app: &Application) {
         resume_btn.connect_clicked(move |_| {
             open_resume_window(&notebook, &window, bin.clone())
         });
+    }
+    {
+        let window = window.clone();
+        settings_btn.connect_clicked(move |_| open_settings_window(&window));
     }
 
     add_tab(&notebook, &window, bin.clone(), None);
