@@ -1,4 +1,4 @@
-# Claude Code — Linux GUI (v0.0.1)
+# Claude Code — Linux GUI (v0.5.2)
 
 A minimal, **native** (GTK4, no Electron) free/open-source desktop GUI for the
 official **Claude Code** CLI on Linux.
@@ -6,67 +6,70 @@ official **Claude Code** CLI on Linux.
 > Not affiliated with, endorsed by, or sponsored by Anthropic. Independent
 > wrapper around the official `claude` command-line tool.
 
-## Honest status
+## Status
 
-- The **CLI integration logic** (per-turn `--session-id` / `--resume`,
-  `--output-format json`, explicit `claude` path resolution) is grounded in
-  empirical probes of the installed CLI.
-- The **Rust/GTK4 code is UNVERIFIED**: it was written without a Rust
-  toolchain or GTK4 dev libraries available to compile or type-check it.
-  Expect to fix compile errors on first build. Most likely fix points are
-  marked `FRAGILE:` in `src/main.rs` (the file picker API and the
-  thread→UI channel are the usual version-churn spots in gtk4-rs).
-- Treat v0.0.1 as a starting point to iterate against real `cargo build`
-  output, not a finished app.
+- Compiles and runs (GTK4 + WebKitGTK 6). Built and used on Ubuntu 24.04.
+- It is a **thin transport**: one persistent `claude -p` process per session
+  tab over the stream-json protocol. The GUI does not reimplement the
+  interactive client — see `DESIGN.md` for what that does and does not allow.
+- GUI behaviour is exercised by hand, not by an automated test suite.
 
-## v0.2 scope
+## Features
 
-- **Multiple sessions** — tabbed (`➕ New session`); each tab is an
-  independent conversation (own folder, history, cost, approved dirs).
-- **Per-session permission mode** — dropdown: `Ask (default)` / `Plan` /
-  `Accept edits` / `Auto`. Maps to `--permission-mode plan|acceptEdits|auto`
-  (Ask = none). **This dropdown is the safety control.** `Plan`/`Auto`
-  exact `-p` behaviour is not yet verified.
-- **All tools enabled** — Bash, Write, Edit, Read, etc. No `--tools`
-  restriction. This is a real agent harness on your own machine: it can run
-  commands and write code. Governed by the per-session mode.
-- In `Ask` mode, a denied action shows what Claude wants (file path *or* the
-  exact shell command) and an **Approve** button; approving resumes with
-  `acceptEdits` + accumulated `--add-dir`.
+- **Multiple sessions** — tabs (`➕ New session`); each is an independent
+  conversation (own folder, history, approved dirs).
+- **Streaming output** with Markdown rendering; live tool / thinking status.
+- **Per-session permission mode** dropdown (`Ask` / `Plan` / `Accept edits`
+  / `Auto`) and an **Approve** flow for denied actions (restarts with
+  `--resume` so context carries).
+- **Built-in commands** (a leading `/`; unknown `/x` is sent verbatim):
+  `/model`, `/permission-mode`, `/clear`, `/status`, `/help`. See `DESIGN.md`.
+- **📎 Image** — paste a clipboard image into the workdir and ask Claude to
+  read it.
+- **🧩 Manage** — browse installed/available plugins, marketplaces, MCP
+  servers (read from `~/.claude.json`, secrets hidden), skills; confirmed
+  plugin/marketplace/mcp actions. Read-only and mutating paths per `DESIGN.md`.
 
-## v0.1 scope (superseded — see v0.2 above)
-
-- **File-editing tools enabled** (`Write,Edit,Read`). **No Bash / command
-  execution** — riskier, and `acceptEdits` behaviour for Bash was not verified.
-- **Permission handling** (grounded in CLI probes):
-  - Reading files **inside** the chosen folder: allowed automatically.
-  - Writing files, or reading/writing **outside** the chosen folder: the CLI
-    denies and reports it; the GUI shows what Claude needs and enables an
-    **Approve** button (typing does NOT grant permission).
-  - **Approve** resumes the session with `--permission-mode acceptEdits`
-    (covers writes/edits) **and** `--add-dir <dir>` for each denied path's
-    directory (covers out-of-folder access). Approved directories accumulate
-    and are re-sent on every later turn.
-  - **"Auto-approve edits"** checkbox: edits proceed without prompting (still
-    no out-of-folder access until something is approved).
-- **No streaming** — each turn waits for the full reply (`--output-format json`).
-- Reply text shown verbatim (may contain stray markup).
-
-## Prerequisites (heavier than a web app — this is the cost of native)
+## Prerequisites
 
 - A Rust toolchain — install via [rustup](https://rustup.rs).
-- GTK4 development libraries, e.g. on Debian/Ubuntu:
-  `sudo apt install libgtk-4-dev build-essential`
+- GTK4 + WebKitGTK 6 development libraries. On Debian/Ubuntu:
+  `sudo apt install libgtk-4-dev libwebkitgtk-6.0-dev build-essential`
 - The official Claude Code CLI installed and authenticated (`claude`).
 
-## Build & run
+## Install (recommended — no more `cargo run`)
 
 ```bash
-cargo run
+./install.sh
 ```
 
-First build will likely surface crate-version / API mismatches (the code is
-uncompiled — see "Honest status"). Paste the errors back to iterate.
+Builds the release binary, installs it to `~/.local/bin/claude-code-linux-gui`,
+and installs the icon + `.desktop`. Then launch from the app menu or run
+`claude-code-linux-gui`. Re-run `./install.sh` to upgrade after code changes;
+`./install.sh --no-build` reuses an existing `target/release` binary.
+
+### Ubuntu 23.10+ : AppArmor / WebKit sandbox
+
+Ubuntu restricts unprivileged user namespaces, so WebKitGTK's mandatory
+`bwrap` sandbox aborts on launch (`bwrap: setting up uid map: Permission
+denied`). Install the bundled AppArmor profile once (it only re-grants
+`userns` to this binary; system-wide hardening is untouched):
+
+```bash
+sudo ./install-apparmor.sh
+```
+
+### Note: single-instance app
+
+It is a single-instance GApplication. If an old copy is still running, a new
+launch just re-activates the old one (you won't see new code). Close the
+running instance first (`pkill -f claude-code-linux-gui`).
+
+## Development build
+
+```bash
+cargo run    # close any installed/running instance first (single-instance)
+```
 
 ## License
 

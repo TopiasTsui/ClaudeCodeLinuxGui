@@ -11,13 +11,34 @@
 # resolves our SVG without any local index.theme at all.
 set -e
 APPID=dev.local.claude_code_linux_gui
+BIN=claude-code-linux-gui
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ICON_SRC="$HERE/assets/hicolor/scalable/apps/$APPID.svg"
 DESK_SRC="$HERE/assets/$APPID.desktop"
 ICON_DST="$HOME/.local/share/icons/hicolor/scalable/apps"
 DESK_DST="$HOME/.local/share/applications"
+BIN_DST="$HOME/.local/bin"
 
-mkdir -p "$ICON_DST" "$DESK_DST"
+# Build + install the release binary so you can launch from the app menu /
+# `claude-code-linux-gui` instead of `cargo run`. Pass --no-build to skip
+# compiling and just install an existing target/release binary.
+if [ "${1:-}" != "--no-build" ]; then
+  CARGO="$(command -v cargo || echo "$HOME/.cargo/bin/cargo")"
+  if [ ! -x "$CARGO" ]; then
+    echo "cargo not found — install Rust or pass --no-build with a prebuilt binary." >&2
+    exit 1
+  fi
+  echo "Building release (this can take a few minutes the first time)…"
+  ( cd "$HERE" && "$CARGO" build --release )
+fi
+RELEASE_BIN="$HERE/target/release/$BIN"
+if [ ! -x "$RELEASE_BIN" ]; then
+  echo "No release binary at $RELEASE_BIN — run without --no-build first." >&2
+  exit 1
+fi
+
+mkdir -p "$ICON_DST" "$DESK_DST" "$BIN_DST"
+install -m 0755 "$RELEASE_BIN" "$BIN_DST/$BIN"
 cp "$ICON_SRC" "$ICON_DST/"
 cp "$DESK_SRC" "$DESK_DST/"
 
@@ -26,9 +47,22 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 echo "Installed:"
+echo "  $BIN_DST/$BIN"
 echo "  $ICON_DST/$APPID.svg"
 echo "  $DESK_DST/$APPID.desktop"
+echo "Launch from the app menu, or run: $BIN"
 echo "Log out/in (or restart GNOME Shell) so the dock picks up the icon."
+
+# The .desktop has Exec=claude-code-linux-gui (bare name → PATH). On Ubuntu
+# ~/.local/bin is on PATH only if it existed when ~/.profile ran; warn if not.
+case ":$PATH:" in
+  *":$BIN_DST:"*) ;;
+  *)
+    echo
+    echo "NOTE: $BIN_DST is not on your PATH. Add it (then log out/in):"
+    echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.profile"
+    ;;
+esac
 
 # Ubuntu 23.10+ blocks unprivileged user namespaces by default, which makes
 # WebKitGTK's bwrap sandbox (and thus this app) crash on launch. Detect that
