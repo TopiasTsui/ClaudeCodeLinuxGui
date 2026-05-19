@@ -1365,15 +1365,19 @@ fn manage_fetch(kind: ManageKind, bin: &str) -> String {
 // v2: confirmed mutating action. Shows the exact `claude …` command, runs
 // it off-thread only on confirm, prints stdout+stderr, then refreshes.
 // Secrets are never placed in argv by the UI itself (MCP add is deferred).
+// `pretty` is the secret-free display string (shown in the dialog AND echoed
+// in the output). `argv` is what actually runs. For commands with no secrets
+// callers pass `format!("claude {}", argv.join(" "))`; MCP add passes a
+// redacted form so env/header values never reach the UI, dialog, or log.
 fn confirm_and_run(
     win: &gtk::Window,
     bin: Rc<String>,
     argv: Vec<String>,
+    pretty: String,
     view: gtk::TextView,
     status: gtk::Label,
     reload: Rc<dyn Fn()>,
 ) {
-    let pretty = format!("claude {}", argv.join(" "));
     let dialog = gtk::AlertDialog::builder()
         .modal(true)
         .message("Run this command?")
@@ -1393,18 +1397,17 @@ fn confirm_and_run(
         let (tx, rx) = async_channel::bounded::<String>(1);
         let bin2 = (*bin).clone();
         let argv2 = argv.clone();
+        let shown = pretty.clone();
         std::thread::spawn(move || {
             let msg = match Command::new(&bin2).args(&argv2).output() {
                 Ok(o) => format!(
-                    "$ claude {}\n[exit {}]\n\n{}{}",
-                    argv2.join(" "),
+                    "$ {}\n[exit {}]\n\n{}{}",
+                    shown,
                     o.status.code().unwrap_or(-1),
                     String::from_utf8_lossy(&o.stdout),
                     String::from_utf8_lossy(&o.stderr),
                 ),
-                Err(e) => {
-                    format!("$ claude {}\n\nfailed to launch: {e}", argv2.join(" "))
-                }
+                Err(e) => format!("$ {shown}\n\nfailed to launch: {e}"),
             };
             let _ = tx.send_blocking(msg);
         });
@@ -1530,10 +1533,12 @@ fn manage_page(win: &gtk::Window, bin: Rc<String>, kind: ManageKind) -> gtk::Wid
                 if !spec.is_empty() {
                     argv.push(spec.clone());
                 }
+                let pretty = format!("claude {}", argv.join(" "));
                 confirm_and_run(
                     &win,
                     bin.clone(),
                     argv,
+                    pretty,
                     view.clone(),
                     status.clone(),
                     reload.clone(),
@@ -1544,11 +1549,140 @@ fn manage_page(win: &gtk::Window, bin: Rc<String>, kind: ManageKind) -> gtk::Wid
         v.append(&abar);
     }
 
+    // v2.1: MCP "Add server" form. env/header VALUES are passed to the CLI
+    // but never shown in the dialog, the echoed command, or the output.
+    if matches!(kind, ManageKind::Mcp) {
+        let form = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let row1 = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let name = gtk::Entry::new();
+        name.set_placeholder_text(Some("server name"));
+        name.set_hexpand(true);
+        let scope = gtk::DropDown::from_strings(&["user", "project", "local"]);
+        let transport = gtk::DropDown::from_strings(&["stdio", "http", "sse"]);
+        row1.append(&gtk::Label::new(Some("name")));
+        row1.append(&name);
+        row1.append(&gtk::Label::new(Some("scope")));
+        row1.append(&scope);
+        row1.append(&gtk::Label::new(Some("transport")));
+        row1.append(&transport);
+
+        let target = gtk::Entry::new();
+        target.set_hexpand(true);
+        target.set_placeholder_text(Some(
+            "stdio: command line (e.g. npx my-mcp-server)   |   http/sse: URL",
+        ));
+        let env = gtk::Entry::new();
+        env.set_hexpand(true);
+        env.set_placeholder_text(Some(
+            "stdio env (optional): KEY=VAL KEY2=VAL2  — values hidden after Add",
+        ));
+        let headers = gtk::Entry::new();
+        headers.set_hexpand(true);
+        headers.set_placeholder_text(Some(
+            "http/sse headers (optional): Name: value ;; Name2: value2  — values hidden",
+        ));
+
+        let addrow = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let addbtn = gtk::Button::with_label("Add server");
+        let hint = gtk::Label::new(Some("env/header values are never displayed or logged"));
+        hint.set_xalign(0.0);
+        addrow.append(&addbtn);
+        addrow.append(&hint);
+
+        form.append(&row1);
+        form.append(&target);
+        form.append(&env);
+        form.append(&headers);
+        form.append(&addrow);
+
+        {
+            let win = win.clone();
+            let bin = bin.clone();
+            let view = view.clone();
+            let status = status.clone();
+            let reload = reload.clone();
+            let (name, scope, transport, target, env, headers) = (
+                name.clone(),
+                scope.clone(),
+                transport.clone(),
+                target.clone(),
+                env.clone(),
+                headers.clone(),
+            );
+            addbtn.connect_clicked(move |_| {
+                let nm = name.text().trim().to_string();
+                let tg = target.text().trim().to_string();
+                if nm.is_empty() || tg.is_empty() {
+                    status.set_text("name and command/URL are required");
+                    return;
+                }
+                let sc = ["user", "project", "local"]
+                    .get(scope.selected() as usize)
+                    .copied()
+                    .unwrap_or("user");
+                let tr = ["stdio", "http", "sse"]
+                    .get(transport.selected() as usize)
+                    .copied()
+                    .unwrap_or("stdio");
+
+                let mut argv: Vec<String> = vec![
+                    "mcp".into(),
+                    "add".into(),
+                    "-s".into(),
+                    sc.into(),
+                    "--transport".into(),
+                    tr.into(),
+                ];
+                // Redacted echo built in lockstep; secret values become ***.
+                let mut shown = format!("claude mcp add -s {sc} --transport {tr}");
+
+                if tr == "stdio" {
+                    for tok in env.text().split_whitespace() {
+                        if let Some((k, _)) = tok.split_once('=') {
+                            argv.push("-e".into());
+                            argv.push(tok.to_string());
+                            shown.push_str(&format!(" -e {k}=***"));
+                        }
+                    }
+                } else {
+                    for h in headers.text().split(";;") {
+                        let h = h.trim();
+                        if h.is_empty() {
+                            continue;
+                        }
+                        let hn = h.split(':').next().unwrap_or(h).trim();
+                        argv.push("--header".into());
+                        argv.push(h.to_string());
+                        shown.push_str(&format!(" --header \"{hn}: ***\""));
+                    }
+                }
+
+                argv.push(nm.clone());
+                shown.push_str(&format!(" {nm}"));
+                if tr == "stdio" {
+                    argv.push("--".into());
+                    argv.extend(tg.split_whitespace().map(String::from));
+                    shown.push_str(&format!(" -- {tg}"));
+                } else {
+                    argv.push(tg.clone());
+                    shown.push_str(&format!(" {tg}"));
+                }
+
+                confirm_and_run(
+                    &win,
+                    bin.clone(),
+                    argv,
+                    shown,
+                    view.clone(),
+                    status.clone(),
+                    reload.clone(),
+                );
+            });
+        }
+        v.append(&form);
+    }
+
     let note = match kind {
-        ManageKind::Mcp => Some(
-            "Add (multi-field form + secret handling) is deferred to v2.1 — \
-             use `claude mcp add …` in a terminal for now.",
-        ),
         ManageKind::Skills => Some(
             "No first-party skill install. Install a plugin that bundles \
              skills via the Plugins tabs.",

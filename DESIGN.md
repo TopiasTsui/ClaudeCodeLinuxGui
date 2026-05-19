@@ -161,10 +161,16 @@ it runs off-thread, its stdout+stderr is shown, then the list refreshes.
 - **Marketplaces**: a `<url|github|path>` field and Add / Remove / Update →
   `claude plugin marketplace …` (adding a marketplace is itself a trust
   decision; same confirmation).
-- **MCP**: a form (name, transport, command-or-URL, optional env/headers,
-  scope = user|project|local) → `claude mcp add` / `add-json`, and
-  Remove by name. No network browse (the CLI has no MCP registry). The
-  stdio-spawns-a-process warning is shown in the confirmation.
+- **MCP** (Add form implemented in v2.1): fields name, scope
+  (user|project|local), transport (stdio|http|sse), command/URL, and
+  optional env / headers → `claude mcp add`; plus Remove by name. No
+  network browse (the CLI has no MCP registry). env applies only to
+  stdio (`-e KEY=VAL`, space-separated input); headers only to http/sse
+  (`--header "Name: value"`, `;;`-separated input); a stdio command line
+  goes after `--`. The confirmation/echo is redacted: `-e KEY=***` and
+  `--header "Name: ***"` — env/header **values** never reach the dialog,
+  the echoed command, or the output. `confirm_and_run` therefore takes a
+  separate secret-free display string distinct from the real argv.
 - **Skills**: no first-party install path. The tab states this and points
   to the Plugins tab (skills ship inside plugins). An optional
   clone/unzip-into-`.claude/skills` entry is explicitly out of default
