@@ -992,8 +992,10 @@ fn build_session_tab(
         "Message Claude Code…  (Enter sends · Shift+Enter newline · /help)",
     ));
     placeholder.add_css_class("dim-label");
-    placeholder.set_xalign(0.0);
-    placeholder.set_yalign(0.0);
+    // Compact widget pinned top-left (not FILL) so the Overlay measures and
+    // redraws it predictably when its visibility toggles.
+    placeholder.set_halign(gtk::Align::Start);
+    placeholder.set_valign(gtk::Align::Start);
     placeholder.set_margin_top(6);
     placeholder.set_margin_start(8);
     placeholder.set_can_target(false);
@@ -1002,11 +1004,13 @@ fn build_session_tab(
     entry_overlay.set_child(Some(&entry_scroll));
     entry_overlay.add_overlay(&placeholder);
     {
-        // Show the placeholder only while the buffer is empty.
+        // Show the placeholder only while the buffer is empty. Toggle once
+        // now for the initial state, then on every buffer change.
         let placeholder = placeholder.clone();
-        entry.buffer().connect_changed(move |b| {
-            placeholder.set_visible(b.char_count() == 0);
-        });
+        let buf = entry.buffer();
+        let sync = move |b: &gtk::TextBuffer| placeholder.set_visible(b.char_count() == 0);
+        sync(&buf);
+        buf.connect_changed(move |b| sync(b));
     }
     let img = gtk::Button::with_label("📎 Image");
     img.set_tooltip_text(Some("Paste an image from the clipboard and send it"));
