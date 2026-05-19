@@ -989,7 +989,7 @@ fn build_session_tab(
     entry_scroll.set_propagate_natural_height(true);
     entry_scroll.set_child(Some(&entry));
     let placeholder = gtk::Label::new(Some(
-        "Message Claude Code…  (Enter sends · Shift+Enter newline · /help)",
+        "Message Claude Code…  (Alt+Enter sends · Enter = newline · /help)",
     ));
     placeholder.add_css_class("dim-label");
     // Compact widget pinned top-left (not FILL) so the Overlay measures and
@@ -1145,14 +1145,17 @@ fn build_session_tab(
         });
     }
     {
-        // Enter sends; Shift+Enter inserts a newline (default TextView
-        // behaviour when we don't consume the key).
+        // Alt+Enter sends. Plain Enter is left entirely to the TextView /
+        // input method: it inserts a newline, and crucially it commits an
+        // IME composition (CJK candidate selection) without sending. We only
+        // intercept Alt+Enter, which no IME or default binding uses, so this
+        // is safe even in Capture phase.
         let send = send.clone();
         let kc = gtk::EventControllerKey::new();
         kc.set_propagation_phase(gtk::PropagationPhase::Capture);
         kc.connect_key_pressed(move |_, key, _, mods| {
             if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
-                && !mods.contains(gtk::gdk::ModifierType::SHIFT_MASK)
+                && mods.contains(gtk::gdk::ModifierType::ALT_MASK)
             {
                 send.emit_clicked();
                 glib::Propagation::Stop
