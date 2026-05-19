@@ -1,0 +1,6 @@
+# GitHub has no native crypto field; the repo's "Sponsor" button links to
+# the README Donate section (USDT/USDC on the Polygon PoS network) and the
+# address on Polygonscan.
+custom:
+  - "https://github.com/TopiasTsui/ClaudeCodeLinuxGui#donate"
+  - "https://polygonscan.com/address/0x5072b3d05f1550f30bd22b0175ca55bb27294bca"

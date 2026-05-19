@@ -113,6 +113,23 @@ for p in $(pgrep -f claude-code-linux-gui); do
 done
 ```
 
+## Donate
+
+If this is useful to you, tips are welcome in **USDT or USDC on the
+Polygon (PoS) network**:
+
+```
+0x5072b3d05f1550f30bd22b0175ca55bb27294bca
+```
+
+[View on Polygonscan](https://polygonscan.com/address/0x5072b3d05f1550f30bd22b0175ca55bb27294bca)
+
+> ⚠️ **Polygon network only.** Send only USDT or USDC on Polygon PoS to
+> this address. Sending other tokens, or the same tokens on a different
+> chain (Ethereum, BSC, etc.), will be **permanently lost** — crypto
+> transfers are irreversible. Double-check the address and network before
+> sending.
+
 ## License
 
 **MIT** — see [`LICENSE`](LICENSE). Use it, modify it, redistribute it,
