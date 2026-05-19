@@ -341,6 +341,26 @@ fn push_msg(tab: &Tab, who: &str, text: &str) {
     render(tab);
 }
 
+// Salvage streamed text before any non-`Ev::Turn` exit (process ended,
+// interrupt, command/Approve respawn) discards the live buffer. Without this
+// the answer the user just watched stream in vanishes when a turn never
+// reaches a `result` event (AskUserQuestion block, kill, supersede). Moves
+// the buffer into `msgs` as a Claude message and clears it. Idempotent: a
+// second call sees an empty buffer and is a no-op, so overlapping paths
+// (Stop + gen-supersede) flush exactly once. Intentional transcript wipes
+// (`/clear`, folder switch) must keep clearing directly, NOT call this.
+fn flush_stream(tab: &Tab) {
+    let live = {
+        let mut s = tab.stream.borrow_mut();
+        let t = s.clone();
+        s.clear();
+        t
+    };
+    if !live.trim().is_empty() {
+        push_msg(tab, "Claude", &live);
+    }
+}
+
 // Three input states. `stop` is the inverse of the send controls: live only
 // while a turn is in flight.
 fn ui_idle(tab: &Tab) {
@@ -647,7 +667,11 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
     glib::spawn_future_local(async move {
         while let Ok(ev) = rx.recv().await {
             if tab.gen.get() != my_gen {
-                break; // a newer process superseded this one — stop silently
+                // A newer process superseded this one — stop silently, but
+                // first salvage any answer this turn streamed before the
+                // respawn (command/Approve) raced it.
+                flush_stream(&tab);
+                break;
             }
             match ev {
                 Ev::Init { model, session_id } => {
@@ -741,7 +765,10 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                     ui_idle(&tab);
                 }
                 Ev::Ended(why) => {
-                    tab.stream.borrow_mut().clear();
+                    // The process died before a `result` (AskUserQuestion
+                    // block, kill, crash). Keep the streamed answer instead
+                    // of erasing it behind the "(session ended)" notice.
+                    flush_stream(&tab);
                     // Rollback invariant (DESIGN): if a command-triggered
                     // respawn dies before producing anything, the argument was
                     // bad. Restore the last-good config and respawn once;
@@ -1388,8 +1415,11 @@ fn build_session_tab(
             if tab_st.sess.borrow().child.is_none() {
                 return;
             }
+            // Salvage what streamed before the kill, then restart. Order
+            // matters: the partial answer must land in the transcript above
+            // the "Stopped" notice.
+            flush_stream(&tab_st);
             spawn_proc(&tab_st, false);
-            tab_st.stream.borrow_mut().clear();
             tab_st.status.set_text("");
             push_msg(
                 &tab_st,
