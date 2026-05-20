@@ -321,6 +321,7 @@ fn render(tab: &Tab) {
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
          body{{background:#1e1e1e;color:#e0e0e0;font-family:system-ui,sans-serif;\
          margin:0;padding:16px;font-size:{body_px}px;line-height:1.55}}\
+         ::selection{{background:#264f78;color:#fff}}\
          .msg{{margin-bottom:18px}}.who{{font-size:{small_px}px;color:#888;margin-bottom:4px}}\
          .user pre,.system pre{{white-space:pre-wrap;word-break:break-word;margin:0;\
          font-family:ui-monospace,monospace}}\
