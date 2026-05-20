@@ -248,10 +248,44 @@ fn render(tab: &Tab) {
     let msgs = tab.msgs.borrow();
     let live = tab.stream.borrow();
     let mut body = String::new();
-    for (who, text) in msgs.iter() {
+    let mut i = 0;
+    while i < msgs.len() {
+        let (who, text) = &msgs[i];
         if who == "Tool" {
-            // Compact live activity line, no header.
-            body.push_str(&format!("<div class=\"tool\">{}</div>", esc(text)));
+            // Collapse a run of consecutive tool calls into one line. A single
+            // tool keeps its full "🔧 Bash: ls …" label (target is useful);
+            // a run of N becomes "🔧 Bash×2, Read×6" so the transcript does
+            // not get buried under a dozen one-line entries between turns.
+            let mut j = i;
+            let mut groups: Vec<(String, usize)> = Vec::new();
+            while j < msgs.len() && msgs[j].0 == "Tool" {
+                let name = msgs[j]
+                    .1
+                    .strip_prefix("🔧 ")
+                    .unwrap_or(&msgs[j].1)
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                match groups.last_mut() {
+                    Some(last) if last.0 == name => last.1 += 1,
+                    _ => groups.push((name, 1)),
+                }
+                j += 1;
+            }
+            let total: usize = groups.iter().map(|(_, n)| n).sum();
+            let line = if total == 1 {
+                msgs[i].1.clone()
+            } else {
+                let parts: Vec<String> = groups
+                    .iter()
+                    .map(|(n, c)| if *c == 1 { n.clone() } else { format!("{n}×{c}") })
+                    .collect();
+                format!("🔧 {}", parts.join(", "))
+            };
+            body.push_str(&format!("<div class=\"tool\">{}</div>", esc(&line)));
+            i = j;
             continue;
         }
         let cls = match who.as_str() {
@@ -269,6 +303,7 @@ fn render(tab: &Tab) {
             esc(who),
             inner
         ));
+        i += 1;
     }
     if !live.is_empty() {
         body.push_str(&format!(
@@ -1722,6 +1757,31 @@ fn add_tab(
                     entry.grab_focus();
                 });
             }
+        }
+    });
+
+    // Coming back from another app (Alt+Tab, dock click) should also land
+    // the cursor in the input — without this, focus stays on whatever last
+    // held it (often the WebView, where typing does nothing). Same per-tab
+    // pattern as switch-page: each tab listens, but only the current page's
+    // handler actually grabs. Deferred 80ms for the same reason the
+    // switch-page grab is — to land after the window-activation focus
+    // shuffle settles.
+    window.connect_is_active_notify({
+        let notebook = notebook.clone();
+        let page = page.clone();
+        let entry = tab.entry.clone();
+        move |w| {
+            if !w.is_active() {
+                return;
+            }
+            if notebook.page_num(&page) != notebook.current_page() {
+                return;
+            }
+            let entry = entry.clone();
+            glib::timeout_add_local_once(Duration::from_millis(80), move || {
+                entry.grab_focus();
+            });
         }
     });
 }
