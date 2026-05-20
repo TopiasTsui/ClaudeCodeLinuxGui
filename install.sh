@@ -38,23 +38,30 @@ if [ ! -x "$RELEASE_BIN" ]; then
 fi
 
 mkdir -p "$ICON_DST" "$DESK_DST" "$BIN_DST"
-install -m 0755 "$RELEASE_BIN" "$BIN_DST/$BIN"
-cp "$ICON_SRC" "$ICON_DST/"
-cp "$DESK_SRC" "$DESK_DST/"
 
-# Kill any running instance so the next launch is the binary just installed.
-# This is a single-instance GApplication: relaunching while an old copy is
-# alive silently re-activates the OLD process (you'd test stale code). Match
-# by real executable path via /proc, never by command-line pattern (pkill -f
-# would also match this script's own path).
+# Kill any running instance BEFORE replacing the binary, so /proc/<pid>/exe
+# still resolves to a real path. If we kill after `install`, the kernel
+# tags the still-mapped old binary as deleted and readlink returns
+# ".../claude-code-linux-gui (deleted)" — the case below would not match
+# and the old process would survive, silently re-activating itself as the
+# single-instance GApplication on the next launch (you'd test stale code).
+# Match by real executable path via /proc, never by command-line pattern
+# (pkill -f would also match this script's own path). The "(deleted)" arm
+# is a belt-and-suspenders fallback for binaries that were already
+# replaced out of band.
 KILLED=0
 for pid in $(pgrep -x "$BIN" 2>/dev/null) $(pgrep -f "$BIN" 2>/dev/null); do
   exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || continue
   case "$exe" in
-    */"$BIN") kill "$pid" 2>/dev/null && KILLED=$((KILLED+1)) ;;
+    */"$BIN" | */"$BIN"" (deleted)")
+      kill "$pid" 2>/dev/null && KILLED=$((KILLED+1)) ;;
   esac
 done
 [ "$KILLED" -gt 0 ] && echo "Stopped $KILLED running instance(s) so the new build takes effect."
+
+install -m 0755 "$RELEASE_BIN" "$BIN_DST/$BIN"
+cp "$ICON_SRC" "$ICON_DST/"
+cp "$DESK_SRC" "$DESK_DST/"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$DESK_DST" 2>/dev/null || true
