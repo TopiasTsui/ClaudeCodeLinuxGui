@@ -311,15 +311,21 @@ fn render(tab: &Tab) {
             md_to_html(&live)
         ));
     }
+    // Stamp the current zoom into the CSS itself, scaling body and small
+    // text proportionally. Doing this here instead of via WebKit's
+    // zoom_level is what makes Ctrl+= / Ctrl+- visibly update *this* tab.
+    let z = current_zoom();
+    let body_px = (14.0 * z).round() as i32;
+    let small_px = (12.0 * z).round() as i32;
     let doc = format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
          body{{background:#1e1e1e;color:#e0e0e0;font-family:system-ui,sans-serif;\
-         margin:0;padding:16px;font-size:14px;line-height:1.55}}\
-         .msg{{margin-bottom:18px}}.who{{font-size:12px;color:#888;margin-bottom:4px}}\
+         margin:0;padding:16px;font-size:{body_px}px;line-height:1.55}}\
+         .msg{{margin-bottom:18px}}.who{{font-size:{small_px}px;color:#888;margin-bottom:4px}}\
          .user pre,.system pre{{white-space:pre-wrap;word-break:break-word;margin:0;\
          font-family:ui-monospace,monospace}}\
          .user pre{{color:#9cdcfe}}.system{{color:#c5915f;font-style:italic}}\
-         .tool{{color:#7fae7f;font-family:ui-monospace,monospace;font-size:12px;\
+         .tool{{color:#7fae7f;font-family:ui-monospace,monospace;font-size:{small_px}px;\
          margin:2px 0;white-space:pre-wrap;word-break:break-word}}\
          code{{background:#2d2d2d;padding:1px 4px;border-radius:3px;\
          font-family:ui-monospace,monospace}}\
@@ -396,10 +402,16 @@ fn flush_stream(tab: &Tab) {
     }
 }
 
-// Transcript zoom. WebKit's zoom_level scales the whole rendered page
-// (body/who/tool sizes together), so font size is one knob, no CSS plumbing.
-// Persisted as a single float in a GUI-local config file (NOT Claude's
-// settings.json) so the choice survives restarts and applies to new tabs.
+// Transcript zoom. The first attempt drove webkit6::WebView::set_zoom_level,
+// but that did not visibly update the tab it was called on — only newly
+// opened tabs picked up the change. So instead the zoom is baked into the
+// rendered HTML's CSS at every render(), and bump_zoom forces a re-render
+// of the current tab right after updating the cached value: the new size
+// is visible *now*, in this session. Persisted as a single float in a
+// GUI-local config file (NOT Claude's settings.json) so the choice
+// survives restarts and applies to new tabs too. Already-open *other*
+// tabs catch up on their next natural render — accepted, vs. wiring a
+// tab registry just for this.
 const ZOOM_MIN: f64 = 0.5;
 const ZOOM_MAX: f64 = 3.0;
 
@@ -425,15 +437,28 @@ fn save_zoom(z: f64) {
     let _ = std::fs::write(p, format!("{z}"));
 }
 
-// Apply a zoom delta (factor, or None to reset to 1.0) to the transcript and
-// persist it. Clamped so it can never shrink to nothing or blow up.
-fn bump_zoom(web: &webkit6::WebView, factor: Option<f64>) {
+// Cached on the GTK main thread so render() can stamp the current size
+// into every CSS without re-reading the disk per delta.
+thread_local! {
+    static CURRENT_ZOOM: Cell<f64> = Cell::new(1.0);
+}
+
+fn current_zoom() -> f64 {
+    CURRENT_ZOOM.with(|c| c.get())
+}
+
+fn init_zoom_cache() {
+    CURRENT_ZOOM.with(|c| c.set(load_zoom()));
+}
+
+fn bump_zoom(tab: &Tab, factor: Option<f64>) {
     let z = match factor {
-        Some(f) => (web.zoom_level() * f).clamp(ZOOM_MIN, ZOOM_MAX),
+        Some(f) => (current_zoom() * f).clamp(ZOOM_MIN, ZOOM_MAX),
         None => 1.0,
     };
-    web.set_zoom_level(z);
+    CURRENT_ZOOM.with(|c| c.set(z));
     save_zoom(z);
+    render(tab);
 }
 
 // Per-process scratch dir for clipboard pastes, under /tmp so they never
@@ -1163,9 +1188,6 @@ fn build_session_tab(
     // — that was overriding the focus we move to the input box below — and so
     // Tab navigation never gets stuck in the rendered HTML.
     web.set_can_focus(false);
-    // Restore the persisted transcript zoom so a new tab opens at the size
-    // the user last chose (Ctrl+= / Ctrl+- / Ctrl+0).
-    web.set_zoom_level(load_zoom());
 
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     // Multi-line input: TextView in a height-bounded ScrolledWindow, with a
@@ -1386,14 +1408,16 @@ fn build_session_tab(
         // read-only transcript. The WebView is kept out of the focus chain
         // (set_can_focus(false)) so keyboard events never reach it directly —
         // focus sits on this input box even after the user mouse-selects text
-        // in the transcript. So intercept here and drive WebKit (editing
-        // commands act on the DOM selection, zoom_level scales the page),
-        // regardless of GTK focus. The input box keeps priority when it has
-        // its own work to do: a live selection (Ctrl+C) or any text to select
-        // (Ctrl+A) falls through to default TextView handling. Zoom keys are
-        // unused by the TextView, so they are always taken.
+        // in the transcript. So intercept here: copy goes through WebKit's
+        // editing command on the DOM selection (focus-independent); zoom
+        // updates the cached CSS-stamped size and re-renders this tab so the
+        // change is visible immediately. The input box keeps priority when
+        // it has its own work to do: a live selection (Ctrl+C) or any text
+        // to select (Ctrl+A) falls through to default TextView handling.
+        // Zoom keys are unused by the TextView, so they are always taken.
         let web = web.clone();
         let entry_c = entry.clone();
+        let tab_z = tab.clone();
         let kc = gtk::EventControllerKey::new();
         kc.set_propagation_phase(gtk::PropagationPhase::Capture);
         kc.connect_key_pressed(move |_, key, _, mods| {
@@ -1416,17 +1440,17 @@ fn build_session_tab(
                 gtk::gdk::Key::equal
                 | gtk::gdk::Key::plus
                 | gtk::gdk::Key::KP_Add => {
-                    bump_zoom(&web, Some(1.1));
+                    bump_zoom(&tab_z, Some(1.1));
                     glib::Propagation::Stop
                 }
                 // Ctrl+- / Ctrl+KP_Subtract → smaller
                 gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract => {
-                    bump_zoom(&web, Some(1.0 / 1.1));
+                    bump_zoom(&tab_z, Some(1.0 / 1.1));
                     glib::Propagation::Stop
                 }
                 // Ctrl+0 / Ctrl+KP_0 → reset to default
                 gtk::gdk::Key::_0 | gtk::gdk::Key::KP_0 => {
-                    bump_zoom(&web, None);
+                    bump_zoom(&tab_z, None);
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -2774,6 +2798,9 @@ fn main() -> glib::ExitCode {
     // Remove paste dirs left behind by previous app processes (crashes,
     // hard kills). Cheap, /tmp-only.
     sweep_stale_paste_dirs();
+    // Load the persisted transcript zoom into the thread-local cache so the
+    // first render() of every new tab already uses it.
+    init_zoom_cache();
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run()
