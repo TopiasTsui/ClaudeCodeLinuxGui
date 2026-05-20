@@ -401,6 +401,39 @@ fn bump_zoom(web: &webkit6::WebView, factor: Option<f64>) {
     save_zoom(z);
 }
 
+// Per-process scratch dir for clipboard pastes, under /tmp so they never
+// pollute the user's project workdir (the old behaviour wrote them in as
+// dotfiles, which still showed up in `ls -a` / `git status`). Always added
+// to the spawned CLI's `--add-dir` allow-list so `Read` against the pasted
+// file needs no permission. Created lazily on first paste; orphans from
+// dead PIDs get swept at app startup.
+fn paste_dir() -> PathBuf {
+    let p = PathBuf::from(format!("/tmp/ccgui-pastes-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&p);
+    p
+}
+
+// Remove /tmp/ccgui-pastes-<pid> directories whose pid is no longer alive.
+// Cheap O(entries) scan; anything missed just survives until the next
+// startup or system /tmp expiry. Linux-only (checks /proc/<pid>), matching
+// the rest of this codebase.
+fn sweep_stale_paste_dirs() {
+    let Ok(rd) = std::fs::read_dir("/tmp") else { return };
+    let me = std::process::id();
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name.strip_prefix("ccgui-pastes-") else { continue };
+        let Ok(pid_n) = pid.parse::<u32>() else { continue };
+        if pid_n == me {
+            continue;
+        }
+        if !Path::new(&format!("/proc/{pid_n}")).exists() {
+            let _ = std::fs::remove_dir_all(ent.path());
+        }
+    }
+}
+
 // Three input states. `stop` is the inverse of the send controls: live only
 // while a turn is in flight.
 fn ui_idle(tab: &Tab) {
@@ -537,6 +570,9 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
     for d in &allowed_dirs {
         cmd.arg("--add-dir").arg(d);
     }
+    // Always allow Read on this app's clipboard-paste scratch dir so a
+    // pasted image just works without prompting for permission.
+    cmd.arg("--add-dir").arg(paste_dir());
     // Apply remaining route-A overrides verbatim (permission-mode already
     // applied above). The CLI validates; a bad value just makes the process
     // exit, which we detect below and roll back.
@@ -1391,20 +1427,18 @@ fn build_session_tab(
         });
     }
 
-    // "📎 Image": read an image off the clipboard, write it into the session
-    // workdir as a dotfile (Read inside the workdir needs no permission), then
-    // send a turn that points Claude at the absolute path. Any text already in
-    // the entry rides along as the accompanying question.
+    // "📎 Image": read an image off the clipboard, write it into the
+    // process-local /tmp paste dir (added to the spawn's --add-dir so Read
+    // needs no permission), then send a turn that points Claude at the
+    // absolute path. Keeps clipboard pastes OUT of the user's project. Any
+    // text already in the entry rides along as the accompanying question.
     {
         let tab_i = tab.clone();
         img.connect_clicked(move |b| {
-            let wd = match tab_i.sess.borrow().workdir.clone() {
-                Some(w) => w,
-                None => {
-                    push_msg(&tab_i, "System", "Choose a folder first.");
-                    return;
-                }
-            };
+            if tab_i.sess.borrow().workdir.is_none() {
+                push_msg(&tab_i, "System", "Choose a folder first.");
+                return;
+            }
             if tab_i.sess.borrow().stdin.is_none() {
                 push_msg(&tab_i, "System", "No running session.");
                 return;
@@ -1417,8 +1451,8 @@ fn build_session_tab(
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis())
                         .unwrap_or(0);
-                    let fname = format!(".ccgui-paste-{ts}.png");
-                    let path = wd.join(&fname);
+                    let fname = format!("ccgui-paste-{ts}.png");
+                    let path = paste_dir().join(&fname);
                     match tex.save_to_png(&path) {
                         Ok(()) => {
                             // Attach, don't send: keep typing; it rides with
@@ -2677,6 +2711,9 @@ fn main() -> glib::ExitCode {
     // Without this, `cargo run` yields WM_CLASS from the binary name and the
     // dock falls back to a generic icon.
     glib::set_prgname(Some(APP_ID));
+    // Remove paste dirs left behind by previous app processes (crashes,
+    // hard kills). Cheap, /tmp-only.
+    sweep_stale_paste_dirs();
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run()
