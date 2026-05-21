@@ -173,11 +173,6 @@ fn resolve_claude() -> String {
 
 struct TurnResult {
     result: String,
-    /// The CLI marks the turn as errored when it ended without a real answer
-    /// — e.g. it called `AskUserQuestion` (interactive, unanswerable in the
-    /// stream-json transport) or was interrupted. In that case `result` holds
-    /// an error blurb, not the assistant text the user watched stream in.
-    is_error: bool,
     session_id: Option<String>,
     usage: Usage,
     denials: Vec<String>,
@@ -534,7 +529,6 @@ fn parse_result(v: &serde_json::Value) -> TurnResult {
         .and_then(|x| x.as_str())
         .unwrap_or("(empty response)")
         .to_string();
-    let is_error = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
     let session_id = v.get("session_id").and_then(|x| x.as_str()).map(str::to_string);
     let u = v.get("usage");
     let tok = |k: &str| {
@@ -575,7 +569,7 @@ fn parse_result(v: &serde_json::Value) -> TurnResult {
             }
         }
     }
-    TurnResult { result, is_error, session_id, usage, denials, denied_dirs }
+    TurnResult { result, session_id, usage, denials, denied_dirs }
 }
 
 fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
@@ -840,11 +834,14 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                 }
                 Ev::Turn(o) => {
                     // Capture the streamed text before dropping the live
-                    // buffer. When a turn ends because Claude needs permission,
-                    // the `result` event carries no assistant text (parsed as
-                    // "(empty response)"), so finalizing with `o.result` alone
-                    // would erase the answer the user just watched stream in,
-                    // right as the approval prompt appears.
+                    // buffer. The `result` event is NOT the full transcript:
+                    // verified against raw stream-json, `result` carries only
+                    // the LAST assistant text block of the turn. So when a
+                    // turn is "write text → call a tool → write more text",
+                    // result == just the trailing block, and everything said
+                    // before the tool call is gone. The accumulated
+                    // text_deltas (this buffer) are the complete answer the
+                    // user watched stream in, so they win whenever non-empty.
                     let streamed = {
                         let mut live = tab.stream.borrow_mut();
                         let s = live.clone();
@@ -864,16 +861,13 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                             s.good_overrides = s.overrides.clone();
                         }
                     }
-                    // The turn's `result` is the canonical final text in the
-                    // normal case. But when it carries no real answer — empty,
-                    // the "(empty response)" placeholder, or an error blurb
-                    // (is_error: AskUserQuestion / interruption) — fall back to
-                    // the text we already streamed so it is NOT erased behind
-                    // the question/selection prompt.
-                    let result_unusable = o.is_error
-                        || o.result == "(empty response)"
-                        || o.result.trim().is_empty();
-                    let final_text = if result_unusable && !streamed.trim().is_empty() {
+                    // Prefer the full streamed transcript; only fall back to
+                    // `result` when nothing streamed (a pure tool-use turn
+                    // with no assistant text, or partial messages disabled).
+                    // This also subsumes the old error/empty special-case:
+                    // on AskUserQuestion / interruption `result` is an error
+                    // blurb, and the streamed text is exactly what we want.
+                    let final_text = if !streamed.trim().is_empty() {
                         streamed
                     } else {
                         o.result.clone()
