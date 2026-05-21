@@ -1,4 +1,4 @@
-# Claude Code — Linux GUI (v0.5.2)
+# Claude Code — Linux GUI (v0.5.3)
 
 A minimal, **native** (GTK4, no Electron) free/open-source desktop GUI for the
 official **Claude Code** CLI on Linux.
