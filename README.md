@@ -19,8 +19,16 @@ official **Claude Code** CLI on Linux.
 - **Multiple sessions** — tabs (`➕ New session`); each is an independent
   conversation (own folder, history, approved dirs). Close one with the
   **✕** on its tab or the `/exit` command (kills that session's `claude`
-  process). Switching tabs puts the cursor straight in that session's input.
+  process). Switching tabs — or returning to the window from another app —
+  puts the cursor straight in the current session's input.
 - **Streaming output** with Markdown rendering; live tool / thinking status.
+  The full answer is preserved even when a turn writes text, calls a tool,
+  then writes more (the part before the tool call no longer vanishes).
+- **Copy & zoom the transcript** — drag to select (the highlight stays
+  visible even though the read-only view never holds keyboard focus);
+  **Ctrl+C** copies the selection, **Ctrl+A** selects all (when the input
+  box is empty). **Ctrl+=** / **Ctrl+-** resize the transcript font and
+  **Ctrl+0** resets; the size is remembered across restarts.
 - **Multi-line input**: **Alt+Enter sends**; plain **Enter inserts a
   newline** and (importantly) commits a CJK/IME composition without sending.
   The **Send** button always sends.
@@ -33,8 +41,9 @@ official **Claude Code** CLI on Linux.
   with `/`-prefix autocomplete from the registry:
   `/model`, `/permission-mode`, `/effort`, `/worktree`, `/fork-session`,
   `/clear`, `/status`, `/help`, `/exit`. See `DESIGN.md`.
-- **📎 Image** — paste a clipboard image; it is *attached* (saved to the
-  workdir) so you can keep typing, and rides with your next message.
+- **📎 Image** — paste a clipboard image; it is *attached* (saved under a
+  per-process `/tmp` dir, never in your project) so you can keep typing, and
+  rides with your next message.
 - **📄 File** — insert a file path (workdir-relative when inside) into the
   message.
 - **⟲ Resume…** — browse and resume a prior session from
