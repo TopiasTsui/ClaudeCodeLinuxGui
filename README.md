@@ -3,6 +3,8 @@
 A minimal, **native** (GTK4, no Electron) free/open-source desktop GUI for the
 official **Claude Code** CLI on Linux.
 
+![Claude Code Linux GUI — multi-session tabs, per-session permission mode, and Markdown-rendered streaming output](assets/screenshot.png)
+
 > Not affiliated with, endorsed by, or sponsored by Anthropic. Independent
 > wrapper around the official `claude` command-line tool.
 
