@@ -186,6 +186,10 @@ enum Ev {
         session_id: Option<String>,
     },
     Delta(String),
+    /// A new text content block started — i.e. Claude resumed narrating after
+    /// a tool call. Marks a paragraph boundary in the accumulated stream so
+    /// the (newline-less) blocks don't get concatenated into one wall.
+    TextBlock,
     Tool(String),
     Thinking,
     Turn(TurnResult),
@@ -813,12 +817,22 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                         }
                     }
                     Some("stream_event") => {
-                        let delta = v
-                            .get("event")
-                            .filter(|e| {
-                                e.get("type").and_then(|t| t.as_str())
-                                    == Some("content_block_delta")
-                            })
+                        let event = v.get("event");
+                        let etype =
+                            event.and_then(|e| e.get("type")).and_then(|t| t.as_str());
+                        // Start of a new *text* block (Claude narrating again
+                        // after a tool call) → mark a paragraph boundary.
+                        if etype == Some("content_block_start")
+                            && event
+                                .and_then(|e| e.get("content_block"))
+                                .and_then(|c| c.get("type"))
+                                .and_then(|t| t.as_str())
+                                == Some("text")
+                        {
+                            let _ = tx.send_blocking(Ev::TextBlock);
+                        }
+                        let delta = event
+                            .filter(|_| etype == Some("content_block_delta"))
                             .and_then(|e| e.get("delta"));
                         match delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()) {
                             Some("text_delta") => {
@@ -885,6 +899,16 @@ fn spawn_proc(tab: &Tab, force_accept_edits: bool) {
                 Ev::Delta(t) => {
                     tab.stream.borrow_mut().push_str(&t);
                     schedule_render(&tab);
+                }
+                Ev::TextBlock => {
+                    // Separate this block from the previous one. Blocks carry
+                    // no trailing newline, so without this they run together
+                    // into a single paragraph. Guarded so repeated starts
+                    // (e.g. an empty block) don't stack blank lines.
+                    let mut live = tab.stream.borrow_mut();
+                    if !live.is_empty() && !live.ends_with('\n') {
+                        live.push_str("\n\n");
+                    }
                 }
                 Ev::Tool(label) => {
                     tab.status.set_text("🔧 working…");
