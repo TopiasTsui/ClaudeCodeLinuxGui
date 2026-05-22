@@ -239,9 +239,43 @@ fn md_to_html(md: &str) -> String {
     out
 }
 
-fn render(tab: &Tab) {
+// The transcript shell, loaded ONCE per WebView (see build_session_tab).
+// render() then mutates the DOM in place (innerHTML on #log / #live) rather
+// than reloading the whole document — calling load_html on every streaming
+// delta is what made the view flash. Zoom-dependent font sizes live in the
+// empty <style id="z">, rewritten on each full render so Ctrl+= still works
+// without a reload.
+const SKELETON: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
+     body{background:#1e1e1e;color:#e0e0e0;font-family:system-ui,sans-serif;\
+     margin:0;padding:16px;line-height:1.55}\
+     ::selection{background:#264f78;color:#fff}\
+     .msg{margin-bottom:18px}.who{color:#888;margin-bottom:4px}\
+     .user pre,.system pre{white-space:pre-wrap;word-break:break-word;margin:0;\
+     font-family:ui-monospace,monospace}\
+     .user pre{color:#9cdcfe}.system{color:#c5915f;font-style:italic}\
+     .tool{color:#7fae7f;font-family:ui-monospace,monospace;\
+     margin:2px 0;white-space:pre-wrap;word-break:break-word}\
+     code{background:#2d2d2d;padding:1px 4px;border-radius:3px;\
+     font-family:ui-monospace,monospace}\
+     pre code{display:block;padding:10px;overflow-x:auto}\
+     table{border-collapse:collapse;margin:8px 0}\
+     th,td{border:1px solid #444;padding:4px 8px}th{background:#2d2d2d}\
+     a{color:#4ea1ff}</style><style id=\"z\"></style></head>\
+     <body><div id=\"log\"></div><div id=\"live\"></div></body></html>";
+
+// Encode an arbitrary string as a JS string literal for safe injection.
+fn js_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+fn eval_js(tab: &Tab, script: &str) {
+    tab.web
+        .evaluate_javascript(script, None, None, gtk::gio::Cancellable::NONE, |_| {});
+}
+
+// The finalized messages (everything except the live streaming bubble).
+fn transcript_msgs_html(tab: &Tab) -> String {
     let msgs = tab.msgs.borrow();
-    let live = tab.stream.borrow();
     let mut body = String::new();
     let mut i = 0;
     while i < msgs.len() {
@@ -300,41 +334,64 @@ fn render(tab: &Tab) {
         ));
         i += 1;
     }
-    if !live.is_empty() {
-        body.push_str(&format!(
+    body
+}
+
+// The live streaming bubble (empty string when no turn is in flight).
+fn live_html(tab: &Tab) -> String {
+    let live = tab.stream.borrow();
+    if live.is_empty() {
+        String::new()
+    } else {
+        format!(
             "<div class=\"msg claude\"><div class=\"who\">Claude</div>{}</div>",
             md_to_html(&live)
-        ));
+        )
     }
-    // Stamp the current zoom into the CSS itself, scaling body and small
-    // text proportionally. Doing this here instead of via WebKit's
-    // zoom_level is what makes Ctrl+= / Ctrl+- visibly update *this* tab.
+}
+
+// Zoom-dependent rules for <style id="z">, scaling body and small text.
+fn zoom_css() -> String {
     let z = current_zoom();
     let body_px = (14.0 * z).round() as i32;
     let small_px = (12.0 * z).round() as i32;
-    let doc = format!(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>\
-         body{{background:#1e1e1e;color:#e0e0e0;font-family:system-ui,sans-serif;\
-         margin:0;padding:16px;font-size:{body_px}px;line-height:1.55}}\
-         ::selection{{background:#264f78;color:#fff}}\
-         .msg{{margin-bottom:18px}}.who{{font-size:{small_px}px;color:#888;margin-bottom:4px}}\
-         .user pre,.system pre{{white-space:pre-wrap;word-break:break-word;margin:0;\
-         font-family:ui-monospace,monospace}}\
-         .user pre{{color:#9cdcfe}}.system{{color:#c5915f;font-style:italic}}\
-         .tool{{color:#7fae7f;font-family:ui-monospace,monospace;font-size:{small_px}px;\
-         margin:2px 0;white-space:pre-wrap;word-break:break-word}}\
-         code{{background:#2d2d2d;padding:1px 4px;border-radius:3px;\
-         font-family:ui-monospace,monospace}}\
-         pre code{{display:block;padding:10px;overflow-x:auto}}\
-         table{{border-collapse:collapse;margin:8px 0}}\
-         th,td{{border:1px solid #444;padding:4px 8px}}th{{background:#2d2d2d}}\
-         a{{color:#4ea1ff}}</style></head><body>{body}\
-         <script>window.scrollTo(0,1e9);</script></body></html>"
-    );
-    tab.web.load_html(&doc, None);
+    format!("body{{font-size:{body_px}px}}.who,.tool{{font-size:{small_px}px}}")
 }
 
-// Debounced render: coalesce streaming deltas to ~150ms to avoid reload storms.
+// Full sync: zoom + finalized messages + live bubble. Used on every message
+// change and on zoom. A no-op until the shell has finished loading — the
+// load-finished handler calls this once the DOM exists.
+fn render(tab: &Tab) {
+    if !tab.web_ready.get() {
+        return;
+    }
+    let script = format!(
+        "document.getElementById('z').textContent={};\
+         document.getElementById('log').innerHTML={};\
+         document.getElementById('live').innerHTML={};\
+         window.scrollTo(0,document.body.scrollHeight);",
+        js_str(&zoom_css()),
+        js_str(&transcript_msgs_html(tab)),
+        js_str(&live_html(tab)),
+    );
+    eval_js(tab, &script);
+}
+
+// Streaming fast-path: only the live bubble changes, so #log — and any text
+// the user has selected in the history — is left untouched.
+fn render_live(tab: &Tab) {
+    if !tab.web_ready.get() {
+        return;
+    }
+    let script = format!(
+        "document.getElementById('live').innerHTML={};\
+         window.scrollTo(0,document.body.scrollHeight);",
+        js_str(&live_html(tab)),
+    );
+    eval_js(tab, &script);
+}
+
+// Debounced live render: coalesce streaming deltas to ~150ms.
 fn schedule_render(tab: &Tab) {
     if tab.render_pending.get() {
         return;
@@ -343,7 +400,7 @@ fn schedule_render(tab: &Tab) {
     let tab = tab.clone();
     glib::timeout_add_local_once(Duration::from_millis(150), move || {
         tab.render_pending.set(false);
-        render(&tab);
+        render_live(&tab);
     });
 }
 
@@ -359,6 +416,10 @@ struct Tab {
     // a spurious "session ended".
     gen: Rc<Cell<u64>>,
     web: webkit6::WebView,
+    // False until the WebView's transcript shell (SKELETON) has finished
+    // loading. render() / render_live() are no-ops before that, because the
+    // #log / #live elements they mutate do not exist yet.
+    web_ready: Rc<Cell<bool>>,
     entry: gtk::TextView,
     img: gtk::Button,
     file: gtk::Button,
@@ -1278,6 +1339,7 @@ fn build_session_tab(
         render_pending: Rc::new(Cell::new(false)),
         gen: Rc::new(Cell::new(0)),
         web: web.clone(),
+        web_ready: Rc::new(Cell::new(false)),
         entry: entry.clone(),
         img: img.clone(),
         file: file.clone(),
@@ -1288,7 +1350,20 @@ fn build_session_tab(
         status: status.clone(),
         close: Rc::new(RefCell::new(None)),
     };
-    render(&tab);
+
+    // Load the transcript shell once; from here on render() mutates the DOM
+    // in place (no reloads → no flicker). render() is a no-op until the load
+    // finishes, so the load-finished handler paints whatever has accumulated.
+    {
+        let tab_r = tab.clone();
+        web.connect_load_changed(move |_, ev| {
+            if ev == webkit6::LoadEvent::Finished {
+                tab_r.web_ready.set(true);
+                render(&tab_r);
+            }
+        });
+    }
+    web.load_html(SKELETON, None);
 
     {
         let tab_fp = tab.clone();
